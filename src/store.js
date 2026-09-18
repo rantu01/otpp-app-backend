@@ -3,8 +3,18 @@
  * MongoDB-backed data layer. Every function talks to the single shared
  * MongoDB database — no filesystem, no db.json, no local JSON files.
  * All documents are JSON-compatible; `_id` (ObjectId) is serialized to string.
+ *
+ * Performance rules applied throughout:
+ *  - lean() plain objects everywhere (no Mongoose document hydration).
+ *  - passwordHash is excluded at the DB level except where login needs it.
+ *  - Filters/sorts/limits run in MongoDB (indexed), never in JS over full
+ *    collections. In-memory scans were removed (device lookup, list search,
+ *    dashboard/profit rollups).
+ *  - Independent queries run concurrently via Promise.all.
+ *  - Heavy rollups (dashboard/profit) use single server-side aggregations.
+ *  - Writes are single atomic ops (no read-before-write unless logic needs it).
  */
-const { getModels } = require('./models');
+const { getModels, deviceKey } = require('./models');
 
 /* ---------- pure helpers (no I/O) ---------- */
 
@@ -68,27 +78,7 @@ function profitConfig() {
   ];
 }
 
-function dayKey(iso) {
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return '';
-  return d.toISOString().slice(0, 10);
-}
-
-function summarizeProfit(approvedPayments, withdrawals) {
-  const amt = (p) => Number(p.amount) || 0;
-  const tsOf = (p) => Date.parse(p.reviewedAt || p.submittedAt) || 0;
-  const now = Date.now();
-  const today = new Date().toISOString().slice(0, 10);
-  let daily = 0;
-  let weekly = 0;
-  let total = 0;
-  for (const p of approvedPayments) {
-    const a = amt(p);
-    total += a;
-    if (dayKey(p.reviewedAt || p.submittedAt) === today) daily += a;
-    if (now - tsOf(p) <= 7 * 24 * 60 * 60 * 1000) weekly += a;
-  }
-  const withdrawnTotal = (withdrawals || []).reduce((s, w) => s + (Number(w.amount) || 0), 0);
+function buildProfitShares(total, daily, weekly, withdrawnTotal, count, withdrawalCount) {
   const remaining = total - withdrawnTotal;
   const people = profitConfig();
   const shares = people.map((pl) => ({
@@ -104,11 +94,52 @@ function summarizeProfit(approvedPayments, withdrawals) {
   return {
     daily, weekly, total, withdrawnTotal,
     remaining,
-    count: approvedPayments.length,
-    withdrawalCount: (withdrawals || []).length,
+    count,
+    withdrawalCount,
     people: shares,
     generatedAt: new Date().toISOString(),
   };
+}
+
+/**
+ * Apply a just-recorded withdrawal to an existing profit snapshot without
+ * re-querying the database. Totals/daily/weekly are untouched by a payout,
+ * so the result is exactly what a recompute would return.
+ */
+function applyWithdrawalProfit(profit, sum) {
+  const withdrawnTotal = Math.round((profit.withdrawnTotal + sum) * 100) / 100;
+  return buildProfitShares(
+    profit.total, profit.daily, profit.weekly,
+    withdrawnTotal, profit.count, profit.withdrawalCount + 1
+  );
+}
+
+/* ---------- pagination / search helpers ---------- */
+
+function pageParams(input = {}, def = 200, max = 500) {
+  let limit = Number(input.limit);
+  if (!Number.isFinite(limit) || limit <= 0) limit = def;
+  limit = Math.min(Math.max(1, Math.floor(limit)), max);
+  let page = Number(input.page);
+  if (!Number.isFinite(page) || page < 1) page = 1;
+  page = Math.floor(page);
+  return { page, limit, skip: (page - 1) * limit };
+}
+
+/** Indexed count when filtered; collection metadata count when unfiltered. */
+async function fastCount(model, filter) {
+  if (!filter || !Object.keys(filter).length) {
+    try {
+      return await model.estimatedDocumentCount();
+    } catch {
+      return model.countDocuments({});
+    }
+  }
+  return model.countDocuments(filter);
+}
+
+function escapeRegex(s) {
+  return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 /* ---------- atomic id counters ---------- */
@@ -118,16 +149,19 @@ async function nextId(kind) {
   const doc = await OtpCounter.findOneAndUpdate(
     { kind },
     { $inc: { seq: 1 } },
-    { new: true, upsert: true }
+    { returnDocument: 'after', upsert: true }
   ).lean();
   return doc.seq;
 }
 
 /* ---------- users ---------- */
 
+const NO_HASH = '-passwordHash';
+
+/** Fresh user for request gating. Hash excluded — none of the gates need it. */
 async function findUserById(id) {
   const { OtpUser } = await getModels();
-  return serialize(await OtpUser.findOne({ id: Number(id) }).lean());
+  return serialize(await OtpUser.findOne({ id: Number(id) }).select(NO_HASH).lean());
 }
 
 async function findUserRawById(id) {
@@ -135,6 +169,7 @@ async function findUserRawById(id) {
   return OtpUser.findOne({ id: Number(id) });
 }
 
+/** Login path only — the password hash IS required for verification. */
 async function findUserByLogin(login) {
   const { OtpUser } = await getModels();
   const key = String(login || '').trim().toLowerCase();
@@ -145,49 +180,85 @@ async function findUserByLogin(login) {
   return serialize(user);
 }
 
+/** Duplicate-account check without fetching the whole document. */
+async function loginExists(login) {
+  const { OtpUser } = await getModels();
+  const key = String(login || '').trim().toLowerCase();
+  if (!key) return false;
+  const hit = await OtpUser.exists({ $or: [{ email: key }, { phone: key }] });
+  return !!hit;
+}
+
 async function userLoginExists(login) {
-  return !!(await findUserByLogin(login));
+  return loginExists(login);
 }
 
 async function findUserByDeviceNorm(norm) {
   const { OtpUser } = await getModels();
   if (!norm) return null;
-  const user = await OtpUser.findOne({ deviceIdNorm: norm, role: { $ne: 'admin' } }).lean();
+  const user = await OtpUser.findOne({ deviceIdNorm: norm, role: { $ne: 'admin' } }).select(NO_HASH).lean();
   return serialize(user);
 }
 
+/**
+ * Indexed device lookup by normalized key (replaces the old full-collection
+ * scan). Matches legacy rows too — deviceIdNorm is backfilled at boot.
+ */
 async function findUserByDevice(deviceId) {
   const { OtpUser } = await getModels();
-  const norm = String(deviceId || '').trim().toLowerCase().replace(/[^a-z0-9]/g, '');
+  const norm = deviceKey(deviceId);
   if (!norm) return null;
-  const users = await OtpUser.find({ deviceId: { $ne: null } }).lean();
-  const hit = users.find((u) => String(u.deviceId || '').trim().toLowerCase().replace(/[^a-z0-9]/g, '') === norm);
-  return serialize(hit || null);
+  const user = await OtpUser.findOne({ deviceIdNorm: norm }).select(NO_HASH).lean();
+  return serialize(user);
 }
 
-async function listUsers(search) {
+function userSearchFilter(search) {
+  const base = { role: { $in: ['user', 'free'] } };
+  const q = String(search || '').trim();
+  if (!q) return base;
+  const or = [
+    { name: { $regex: escapeRegex(q), $options: 'i' } },
+    { email: { $regex: escapeRegex(q), $options: 'i' } },
+    { phone: { $regex: escapeRegex(q), $options: 'i' } },
+  ];
+  if (/^\d+$/.test(q)) or.push({ id: Number(q) });
+  return { ...base, $or: or };
+}
+
+/**
+ * DB-filtered, DB-sorted, paginated user list.
+ * Default limit keeps admin UI behavior (sees everything at current scale).
+ */
+async function listUsers(search, opts = {}) {
   const { OtpUser } = await getModels();
-  const q = String(search || '').toLowerCase();
-  let users = await OtpUser.find({ role: { $ne: 'admin' } }).sort({ id: -1 }).lean();
-  if (q) {
-    users = users.filter((u) => String(u.id).includes(q)
-      || (u.name || '').toLowerCase().includes(q)
-      || (u.email || '').toLowerCase().includes(q)
-      || (u.phone || '').includes(q));
-  }
-  return serialize(users);
+  const { page, limit, skip } = pageParams(opts);
+  const filter = userSearchFilter(search);
+  const [users, total] = await Promise.all([
+    OtpUser.find(filter).select(NO_HASH).sort({ id: -1 }).skip(skip).limit(limit).lean(),
+    fastCount(OtpUser, filter),
+  ]);
+  return { users: serialize(users), total, page, limit, hasMore: skip + users.length < total };
 }
 
 async function createUser(data) {
   const { OtpUser } = await getModels();
   const id = await nextId('user');
-  const doc = await OtpUser.create({ id, ...data });
-  return serialize(doc.toObject());
+  try {
+    const doc = await OtpUser.create({ id, ...data });
+    return serialize(doc.toObject());
+  } catch (e) {
+    if (e && e.code === 11000) {
+      const err = new Error('Account already exists.');
+      err.code = 'DUPLICATE_LOGIN';
+      throw err;
+    }
+    throw e;
+  }
 }
 
 async function updateUserById(id, patch) {
   const { OtpUser } = await getModels();
-  const doc = await OtpUser.findOneAndUpdate({ id: Number(id) }, { $set: patch }, { new: true }).lean();
+  const doc = await OtpUser.findOneAndUpdate({ id: Number(id) }, { $set: patch }, { returnDocument: 'after' }).select(NO_HASH).lean();
   return serialize(doc);
 }
 
@@ -199,17 +270,18 @@ async function deleteUserById(id) {
 
 async function countUsers() {
   const { OtpUser } = await getModels();
-  return OtpUser.countDocuments({ role: { $ne: 'admin' } });
+  return OtpUser.countDocuments({ role: { $in: ['user', 'free'] } });
 }
 
 /* ---------- packages ---------- */
 
 async function listPackages(activeOnly) {
   const { OtpPackage } = await getModels();
-  const filter = activeOnly ? { status: 'active' } : {};
-  const docs = await OtpPackage.find(filter).lean();
-  docs.sort((a, b) => (activeOnly ? a.price - b.price : a.id - b.id));
-  return serialize(docs);
+  if (activeOnly) {
+    // Covered by { status: 1, price: 1 } — filter + sort in the index.
+    return serialize(await OtpPackage.find({ status: 'active' }).sort({ price: 1 }).lean());
+  }
+  return serialize(await OtpPackage.find({}).sort({ id: 1 }).lean());
 }
 
 async function findPackageById(id) {
@@ -226,10 +298,11 @@ async function createPackage(data) {
   return serialize(doc.toObject());
 }
 
+/** Single atomic op (was read-then-write); null when missing. */
 async function updatePackageById(id, patch) {
   const { OtpPackage } = await getModels();
   const doc = await OtpPackage.findOneAndUpdate(
-    { id: Number(id) }, { $set: { ...patch, updatedAt: nowIso() } }, { new: true }
+    { id: Number(id) }, { $set: { ...patch, updatedAt: nowIso() } }, { returnDocument: 'after' }
   ).lean();
   return serialize(doc);
 }
@@ -244,10 +317,11 @@ async function deletePackageById(id) {
 
 async function listMethods(activeOnly) {
   const { OtpMethod } = await getModels();
-  const filter = activeOnly ? { status: 'active' } : {};
-  const docs = await OtpMethod.find(filter).lean();
-  docs.sort((a, b) => (a.sortOrder || 0) - (b.sortOrder || 0));
-  return serialize(docs);
+  if (activeOnly) {
+    // Covered by { status: 1, sortOrder: 1 }.
+    return serialize(await OtpMethod.find({ status: 'active' }).sort({ sortOrder: 1 }).lean());
+  }
+  return serialize(await OtpMethod.find({}).sort({ sortOrder: 1 }).lean());
 }
 
 async function findMethodById(id) {
@@ -265,10 +339,11 @@ async function createMethod(data) {
   return serialize(doc.toObject());
 }
 
+/** Single atomic op (was read-then-write); null when missing. */
 async function updateMethodById(id, patch) {
   const { OtpMethod } = await getModels();
   const doc = await OtpMethod.findOneAndUpdate(
-    { id: Number(id) }, { $set: { ...patch, updatedAt: nowIso() } }, { new: true }
+    { id: Number(id) }, { $set: { ...patch, updatedAt: nowIso() } }, { returnDocument: 'after' }
   ).lean();
   return serialize(doc);
 }
@@ -286,25 +361,57 @@ async function findPaymentById(id) {
   return serialize(await OtpPayment.findOne({ id: Number(id) }).lean());
 }
 
-async function listPayments({ status, search } = {}) {
-  const { OtpPayment } = await getModels();
+function paymentFilter({ status, search, before } = {}) {
   const filter = {};
   if (status) filter.status = String(status).toUpperCase();
-  let docs = await OtpPayment.find(filter).sort({ id: -1 }).lean();
-  if (search) {
-    const q = String(search).toLowerCase();
-    docs = docs.filter((p) => String(p.id).includes(q) || String(p.userId).includes(q)
-      || (p.userName || '').toLowerCase().includes(q)
-      || (p.transactionId || '').toLowerCase().includes(q)
-      || (p.packageName || '').toLowerCase().includes(q)
-      || (p.paymentMethodName || '').toLowerCase().includes(q));
+  if (before !== undefined && before !== null && String(before).trim() !== '') {
+    filter.id = { $lt: Number(before) };
   }
-  return serialize(docs);
+  if (search) {
+    const q = String(search).trim();
+    if (q) {
+      const or = [
+        { userName: { $regex: escapeRegex(q), $options: 'i' } },
+        { transactionId: { $regex: escapeRegex(q), $options: 'i' } },
+        { packageName: { $regex: escapeRegex(q), $options: 'i' } },
+        { paymentMethodName: { $regex: escapeRegex(q), $options: 'i' } },
+      ];
+      if (/^\d+$/.test(q)) {
+        const n = Number(q);
+        or.push({ id: n }, { userId: n });
+      }
+      filter.$or = or;
+    }
+  }
+  return filter;
 }
 
-async function listUserPayments(userId) {
+/**
+ * DB-filtered, DB-sorted ({ status: 1, id: -1 } / id index), paginated.
+ * `before` enables cursor paging (id < before, newest first — no skip cost).
+ */
+async function listPayments({ status, search, page, limit, before } = {}) {
   const { OtpPayment } = await getModels();
-  return serialize(await OtpPayment.find({ userId: Number(userId) }).sort({ id: -1 }).lean());
+  const pg = pageParams({ page, limit });
+  const filter = paymentFilter({ status, search, before });
+  const skip = before ? 0 : pg.skip;
+  const [docs, total] = await Promise.all([
+    OtpPayment.find(filter).sort({ id: -1 }).skip(skip).limit(pg.limit).lean(),
+    fastCount(OtpPayment, filter),
+  ]);
+  return { payments: serialize(docs), total, page: before ? 1 : pg.page, limit: pg.limit, hasMore: before ? docs.length === pg.limit : skip + docs.length < total };
+}
+
+async function listUserPayments(userId, opts = {}) {
+  const { OtpPayment } = await getModels();
+  const pg = pageParams({ ...opts, limit: opts.limit ?? 200 });
+  const filter = { userId: Number(userId) };
+  const [docs, total] = await Promise.all([
+    // Covered by { userId: 1, id: -1 }.
+    OtpPayment.find(filter).sort({ id: -1 }).skip(pg.skip).limit(pg.limit).lean(),
+    fastCount(OtpPayment, filter),
+  ]);
+  return serialize(docs);
 }
 
 async function countPendingPayments() {
@@ -324,7 +431,7 @@ async function hasPendingRefToMethod(methodId) {
 
 async function findDuplicateTxid(norm) {
   const { OtpPayment } = await getModels();
-  return serialize(await OtpPayment.findOne({ transactionIdNorm: norm, status: { $ne: 'CANCELLED' } }).lean());
+  return serialize(await OtpPayment.findOne({ transactionIdNorm: norm, status: { $ne: 'CANCELLED' } }).select({ _id: 1, id: 1 }).lean());
 }
 
 async function createPayment(data) {
@@ -350,56 +457,69 @@ async function createPayment(data) {
  * findOneAndUpdate with a status filter = compare-and-swap).
  */
 async function approvePaymentAtomic(paymentId, reviewerId) {
-  const { OtpPayment, OtpUser, OtpSubscription } = await getModels();
+  const { OtpPayment, OtpUser, OtpPackage, OtpSubscription } = await getModels();
   const reviewedAt = nowIso();
   const payment = await OtpPayment.findOneAndUpdate(
     { id: Number(paymentId), status: 'PENDING' },
     { $set: { status: 'APPROVED', reviewedAt, reviewedBy: reviewerId } },
-    { new: true }
+    { returnDocument: 'after' }
   ).lean();
   if (!payment) {
-    const existing = await OtpPayment.findOne({ id: Number(paymentId) }).lean();
+    const existing = await OtpPayment.findOne({ id: Number(paymentId) }).select({ status: 1 }).lean();
     const err = new Error(existing ? 'Payment has already been reviewed.' : 'Payment not found.');
     err.code = existing ? 'ALREADY_REVIEWED' : 'NOT_FOUND';
     err.status = existing ? existing.status : null;
     throw err;
   }
-  const user = await OtpUser.findOne({ id: payment.userId });
-  if (!user) {
+  // Independent reads, concurrently.
+  const [userDoc, pkgDoc] = await Promise.all([
+    OtpUser.findOne({ id: payment.userId }),
+    OtpPackage.findOne({ id: payment.packageId }).lean(),
+  ]);
+  if (!userDoc) {
     const err = new Error('User not found.');
     err.code = 'USER_NOT_FOUND';
     throw err;
   }
-  const pkgDoc = await getModels().then((m) => m.OtpPackage.findOne({ id: payment.packageId }).lean());
   if (!pkgDoc) {
     const err = new Error('Package no longer exists.');
     err.code = 'PACKAGE_GONE';
     throw err;
   }
-  const { start, expire } = activationWindow(user.toObject(), pkgDoc.durationDays, Date.now());
-  user.currentPackageId = pkgDoc.id;
-  user.currentPackageName = pkgDoc.name;
-  user.packageStartDate = new Date(start).toISOString();
-  user.packageExpireDate = new Date(expire).toISOString();
-  if (user.status !== 'active') user.status = 'active';
-  await user.save();
+  const { start, expire } = activationWindow(userDoc.toObject(), pkgDoc.durationDays, Date.now());
+  const startIso = new Date(start).toISOString();
+  const expireIso = new Date(expire).toISOString();
+  // Single atomic user update (was fetch-mutate-save round trips).
+  const updatedUser = await OtpUser.findOneAndUpdate(
+    { id: userDoc.id },
+    {
+      $set: {
+        currentPackageId: pkgDoc.id,
+        currentPackageName: pkgDoc.name,
+        packageStartDate: startIso,
+        packageExpireDate: expireIso,
+        ...(userDoc.status !== 'active' ? { status: 'active' } : {}),
+      },
+    },
+    { returnDocument: 'after' }
+  ).select(NO_HASH).lean();
   const subId = await nextId('subscription');
   const sub = await OtpSubscription.create({
     id: subId,
-    userId: user.id,
+    userId: userDoc.id,
     packageId: pkgDoc.id,
     packageName: pkgDoc.name,
     price: payment.amount,
     durationDays: pkgDoc.durationDays,
-    startDate: user.packageStartDate,
-    expireDate: user.packageExpireDate,
+    startDate: startIso,
+    expireDate: expireIso,
     status: 'active',
     paymentRequestId: payment.id,
     createdAt: nowIso(),
     createdBy: reviewerId,
-    deviceId: user.deviceIdNorm || user.deviceId || null,
+    deviceId: userDoc.deviceIdNorm || userDoc.deviceId || null,
   });
-  return { payment: serialize(payment), subscription: serialize(sub.toObject()), user: publicUser(user.toObject()) };
+  return { payment: serialize(payment), subscription: serialize(sub.toObject()), user: publicUser(updatedUser) };
 }
 
 async function rejectPaymentAtomic(paymentId, reviewerId, reason) {
@@ -414,10 +534,10 @@ async function rejectPaymentAtomic(paymentId, reviewerId, reason) {
         rejectionReason: String(reason || 'Transaction ID could not be verified.'),
       },
     },
-    { new: true }
+    { returnDocument: 'after' }
   ).lean();
   if (!payment) {
-    const existing = await OtpPayment.findOne({ id: Number(paymentId) }).lean();
+    const existing = await OtpPayment.findOne({ id: Number(paymentId) }).select({ status: 1 }).lean();
     const err = new Error(existing ? 'Payment has already been reviewed.' : 'Payment not found.');
     err.code = existing ? 'ALREADY_REVIEWED' : 'NOT_FOUND';
     err.status = existing ? existing.status : null;
@@ -428,14 +548,22 @@ async function rejectPaymentAtomic(paymentId, reviewerId, reason) {
 
 /* ---------- subscriptions ---------- */
 
-async function listUserSubscriptions(userId) {
+async function listUserSubscriptions(userId, opts = {}) {
   const { OtpSubscription } = await getModels();
-  return serialize(await OtpSubscription.find({ userId: Number(userId) }).sort({ id: -1 }).lean());
+  const pg = pageParams({ ...opts, limit: opts.limit ?? 200 });
+  // Covered by { userId: 1, id: -1 }.
+  const docs = await OtpSubscription.find({ userId: Number(userId) }).sort({ id: -1 }).skip(pg.skip).limit(pg.limit).lean();
+  return serialize(docs);
 }
 
-async function listAllSubscriptions() {
+async function listAllSubscriptions(opts = {}) {
   const { OtpSubscription } = await getModels();
-  return serialize(await OtpSubscription.find({}).sort({ id: -1 }).lean());
+  const pg = pageParams(opts);
+  const [docs, total] = await Promise.all([
+    OtpSubscription.find({}).sort({ id: -1 }).skip(pg.skip).limit(pg.limit).lean(),
+    fastCount(OtpSubscription, {}),
+  ]);
+  return { subscriptions: serialize(docs), total, page: pg.page, limit: pg.limit, hasMore: pg.skip + docs.length < total };
 }
 
 async function createSubscription(data) {
@@ -447,13 +575,19 @@ async function createSubscription(data) {
 
 /* ---------- notifications / fcm / versions ---------- */
 
-async function listNotifications(limit = 100) {
+async function listNotifications(opts = {}) {
   const { OtpNotification } = await getModels();
-  return serialize(await OtpNotification.find({}).sort({ id: -1 }).limit(limit).lean());
+  const pg = pageParams({ ...opts, limit: opts.limit ?? 100, page: opts.page ?? 1 }, 100);
+  const [docs, total] = await Promise.all([
+    OtpNotification.find({}).sort({ id: -1 }).skip(pg.skip).limit(pg.limit).lean(),
+    fastCount(OtpNotification, {}),
+  ]);
+  return { notifications: serialize(docs), total, page: pg.page, limit: pg.limit, hasMore: pg.skip + docs.length < total };
 }
 
 async function countUnreadNotifications() {
   const { OtpNotification } = await getModels();
+  // Covered by { read: 1, id: -1 } prefix.
   return OtpNotification.countDocuments({ read: false });
 }
 
@@ -483,39 +617,196 @@ async function countFcmTokens() {
   return OtpFcmToken.countDocuments();
 }
 
+/**
+ * App-version config is tiny and read on every app start but changes almost
+ * never. Short TTL cache (60s) with invalidation on write — reads stay live
+ * enough for update prompts while skipping a DB round trip on hot paths.
+ */
+const VERSION_TTL_MS = 60 * 1000;
+let versionCache = { at: 0, docs: null };
+function clearVersionCache() {
+  versionCache = { at: 0, docs: null };
+}
+
 async function listVersions() {
+  if (versionCache.docs && Date.now() - versionCache.at < VERSION_TTL_MS) return versionCache.docs;
   const { OtpVersion } = await getModels();
-  return serialize(await OtpVersion.find({}).lean());
+  const docs = serialize(await OtpVersion.find({}).lean());
+  versionCache = { at: Date.now(), docs };
+  return docs;
 }
 
 async function findVersion(platform) {
-  const { OtpVersion } = await getModels();
-  return serialize(await OtpVersion.findOne({ platform: String(platform).toLowerCase() }).lean());
+  const plat = String(platform || 'android').toLowerCase();
+  const all = await listVersions();
+  return all.find((v) => String(v.platform).toLowerCase() === plat) || null;
+}
+
+async function findFirstVersion() {
+  const all = await listVersions();
+  return all[0] || null;
 }
 
 async function upsertVersion(platform, patch) {
   const { OtpVersion } = await getModels();
   const plat = String(platform || 'android').toLowerCase();
-  let doc = await OtpVersion.findOne({ platform: plat }).lean();
-  if (!doc) {
-    const id = await nextId('appVersion');
+  // Update-first: the common case is a single atomic op.
+  const updated = await OtpVersion.findOneAndUpdate(
+    { platform: plat }, { $set: { ...patch, updatedAt: nowIso() } }, { returnDocument: 'after' }
+  ).lean();
+  clearVersionCache();
+  if (updated) return serialize(updated);
+  const id = await nextId('appVersion');
+  try {
     const created = await OtpVersion.create({
       id, platform: plat, latestVersion: '1.0.0', minimumSupportedVersion: '1.0.0',
       updateRequired: false, updateUrl: '', message: '', updatedAt: nowIso(), ...patch,
     });
     return serialize(created.toObject());
+  } catch (e) {
+    if (e && e.code === 11000) {
+      // Lost a create race — read back the winner.
+      const winner = await OtpVersion.findOneAndUpdate(
+        { platform: plat }, { $set: { ...patch, updatedAt: nowIso() } }, { returnDocument: 'after' }
+      ).lean();
+      return serialize(winner);
+    }
+    throw e;
   }
-  const updated = await OtpVersion.findOneAndUpdate(
-    { platform: plat }, { $set: { ...patch, updatedAt: nowIso() } }, { new: true }
-  ).lean();
-  return serialize(updated);
 }
 
-/* ---------- withdrawals + profit ---------- */
+/* ---------- withdrawals + profit (aggregation, no full scans) ---------- */
 
-async function listWithdrawals() {
+const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
+
+/**
+ * Single server-side pass over payments: status counts + revenue (for the
+ * dashboard) and daily/weekly/total APPROVED sums (for profit). $match first,
+ * no documents cross the wire.
+ */
+async function paymentRollup() {
+  const { OtpPayment } = await getModels();
+  const nowMs = Date.now();
+  const todayStr = new Date(nowMs).toISOString().slice(0, 10);
+  const rows = await OtpPayment.aggregate([
+    {
+      $facet: {
+        byStatus: [
+          { $match: { status: { $in: ['PENDING', 'APPROVED', 'REJECTED'] } } },
+          { $group: { _id: '$status', n: { $sum: 1 }, rev: { $sum: '$amount' } } },
+        ],
+        profit: [
+          { $match: { status: 'APPROVED' } },
+          {
+            $project: {
+              amount: 1,
+              ts: {
+                $dateFromString: {
+                  dateString: { $ifNull: ['$reviewedAt', '$submittedAt'] },
+                  onError: null,
+                  onNull: null,
+                },
+              },
+            },
+          },
+          {
+            $group: {
+              _id: null,
+              n: { $sum: 1 },
+              total: { $sum: '$amount' },
+              daily: {
+                $sum: {
+                  $cond: [
+                    { $eq: [{ $dateToString: { format: '%Y-%m-%d', date: '$ts' } }, todayStr] },
+                    '$amount',
+                    0,
+                  ],
+                },
+              },
+              weekly: {
+                $sum: { $cond: [{ $lte: [{ $subtract: ['$$NOW', '$ts'] }, WEEK_MS] }, '$amount', 0] },
+              },
+            },
+          },
+        ],
+      },
+    },
+  ]);
+  const facet = (rows && rows[0]) || { byStatus: [], profit: [] };
+  const byStatus = {};
+  for (const r of facet.byStatus || []) byStatus[r._id] = { n: r.n || 0, rev: r.rev || 0 };
+  return {
+    byStatus,
+    profit: (facet.profit || [])[0] || null,
+  };
+}
+
+async function withdrawalRollup() {
   const { OtpWithdrawal } = await getModels();
-  return serialize(await OtpWithdrawal.find({}).sort({ id: -1 }).lean());
+  const rows = await OtpWithdrawal.aggregate([
+    { $group: { _id: null, n: { $sum: 1 }, total: { $sum: '$amount' } } },
+  ]);
+  const r = rows[0] || {};
+  return { n: r.n || 0, total: r.total || 0 };
+}
+
+async function profitSummary() {
+  const [pay, wd] = await Promise.all([paymentRollup(), withdrawalRollup()]);
+  const p = pay.profit || {};
+  return buildProfitShares(
+    p.total || 0, p.daily || 0, p.weekly || 0,
+    wd.total, p.n || 0, wd.n
+  );
+}
+
+async function dashboardStats() {
+  const { OtpUser, OtpPayment } = await getModels();
+  const nowStr = nowIso();
+  // One payment pipeline (status counts + profit, no doc transfer) plus
+  // metadata/indexed counts — all concurrently. totalPayments uses
+  // collection metadata (O(1)) instead of scanning.
+  const [pay, totalPayments, totalUsers, activeUsers, wd] = await Promise.all([
+    paymentRollup(),
+    OtpPayment.estimatedDocumentCount().catch(() => OtpPayment.countDocuments({})),
+    OtpUser.countDocuments({ role: { $in: ['user', 'free'] } }),
+    OtpUser.countDocuments({
+      role: { $in: ['user', 'free'] },
+      currentPackageId: { $ne: null },
+      packageExpireDate: { $gt: nowStr },
+    }),
+    withdrawalRollup(),
+  ]);
+  const st = (k) => (pay.byStatus[k] ? pay.byStatus[k].n : 0);
+  const p = pay.profit || {};
+  const profit = buildProfitShares(p.total || 0, p.daily || 0, p.weekly || 0, wd.total, p.n || 0, wd.n);
+  return {
+    stats: {
+      totalPayments,
+      pending: st('PENDING'),
+      approved: st('APPROVED'),
+      rejected: st('REJECTED'),
+      approvedRevenue: pay.byStatus.APPROVED ? pay.byStatus.APPROVED.rev : 0,
+      activeSubscriptions: activeUsers,
+      expiredSubscriptions: Math.max(0, totalUsers - activeUsers),
+      totalUsers,
+      dailyProfit: profit.daily, weeklyProfit: profit.weekly, totalProfit: profit.total,
+      withdrawnTotal: profit.withdrawnTotal, remainingProfit: profit.remaining,
+      withdrawalCount: profit.withdrawalCount,
+    },
+    profit,
+  };
+}
+
+/* ---------- withdrawals list ---------- */
+
+async function listWithdrawals(opts = {}) {
+  const { OtpWithdrawal } = await getModels();
+  const pg = pageParams(opts);
+  const [docs, total] = await Promise.all([
+    OtpWithdrawal.find({}).sort({ id: -1 }).skip(pg.skip).limit(pg.limit).lean(),
+    fastCount(OtpWithdrawal, {}),
+  ]);
+  return { withdrawals: serialize(docs), total, page: pg.page, limit: pg.limit, hasMore: pg.skip + docs.length < total };
 }
 
 async function createWithdrawal(data) {
@@ -525,44 +816,12 @@ async function createWithdrawal(data) {
   return serialize(doc.toObject());
 }
 
-async function profitSummary() {
-  const { OtpPayment, OtpWithdrawal } = await getModels();
-  const approved = await OtpPayment.find({ status: 'APPROVED' }).lean();
-  const withdrawals = await OtpWithdrawal.find({}).lean();
-  return summarizeProfit(approved, withdrawals);
-}
-
-async function dashboardStats() {
-  const { OtpPayment, OtpUser } = await getModels();
-  const payments = await OtpPayment.find({}).lean();
-  const pending = payments.filter((p) => p.status === 'PENDING').length;
-  const approved = payments.filter((p) => p.status === 'APPROVED');
-  const rejected = payments.filter((p) => p.status === 'REJECTED').length;
-  const revenue = approved.reduce((s, p) => s + (Number(p.amount) || 0), 0);
-  const now = Date.now();
-  const users = await OtpUser.find({ role: { $ne: 'admin' } }).lean();
-  const active = users.filter((u) => u.currentPackageId && u.packageExpireDate && Date.parse(u.packageExpireDate) > now).length;
-  const expired = users.filter((u) => !u.currentPackageId || !u.packageExpireDate || Date.parse(u.packageExpireDate) <= now).length;
-  const profit = summarizeProfit(approved, await listWithdrawals());
-  return {
-    stats: {
-      totalPayments: payments.length, pending, approved: approved.length, rejected,
-      approvedRevenue: revenue, activeSubscriptions: active, expiredSubscriptions: expired,
-      totalUsers: users.length,
-      dailyProfit: profit.daily, weeklyProfit: profit.weekly, totalProfit: profit.total,
-      withdrawnTotal: profit.withdrawnTotal, remainingProfit: profit.remaining,
-      withdrawalCount: profit.withdrawalCount,
-    },
-    profit,
-  };
-}
-
 /* ---------- idempotency ---------- */
 
 async function findPaymentIdByIdemKey(key) {
   if (!key) return null;
   const { OtpIdemKey } = await getModels();
-  const row = await OtpIdemKey.findOne({ key: String(key) }).lean();
+  const row = await OtpIdemKey.findOne({ key: String(key) }).select({ paymentId: 1 }).lean();
   return row ? row.paymentId : null;
 }
 
@@ -587,12 +846,12 @@ function activationWindow(user, durationDays, nowMs) {
 
 module.exports = {
   // pure helpers
-  normalizeTxid, normalizeDeviceId, nowIso, cmpVersions, publicUser,
-  profitConfig, profitSummary, serialize,
+  normalizeTxid, normalizeDeviceId, deviceKey, nowIso, cmpVersions, publicUser,
+  profitConfig, profitSummary, applyWithdrawalProfit, serialize,
   // counters
   nextId,
   // users
-  findUserById, findUserRawById, findUserByLogin, userLoginExists,
+  findUserById, findUserRawById, findUserByLogin, userLoginExists, loginExists,
   findUserByDeviceNorm, findUserByDevice, listUsers, createUser,
   updateUserById, deleteUserById, countUsers,
   // packages / methods
@@ -606,7 +865,8 @@ module.exports = {
   listUserSubscriptions, listAllSubscriptions, createSubscription,
   // notifications / fcm / versions
   listNotifications, countUnreadNotifications, createNotification, markAllNotificationsRead,
-  addFcmToken, countFcmTokens, listVersions, findVersion, upsertVersion,
+  addFcmToken, countFcmTokens, listVersions, findVersion, findFirstVersion, upsertVersion,
+  clearVersionCache,
   // withdrawals / profit
   listWithdrawals, createWithdrawal, dashboardStats,
   // idempotency

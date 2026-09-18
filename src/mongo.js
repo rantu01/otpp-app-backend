@@ -46,9 +46,15 @@ function ensureMongo() {
   connectPromise = driver
     .connect(uri, {
       dbName: getDbName(),
+      // Pool: one shared client for all requests. maxPoolSize 10 fits small
+      // Atlas tiers while absorbing admin-dashboard + user-app bursts;
+      // minPoolSize 2 keeps warm sockets so hot paths skip handshakes.
       maxPoolSize: 10,
-      minPoolSize: 1,
-      serverSelectionTimeoutMS: 10000,
+      minPoolSize: 2,
+      // Fail fast on unreachable clusters instead of hanging requests.
+      serverSelectionTimeoutMS: 5000,
+      socketTimeoutMS: 45000,
+      maxIdleTimeMS: 30000,
     })
     .then(() => {
       mongoose = driver;

@@ -13,6 +13,36 @@
 const { ensureMongo } = require('./mongo');
 
 let cached = null;
+let backfilled = false;
+
+/**
+ * Canonical device lookup key: case-insensitive, punctuation-insensitive.
+ * Stored in `deviceIdNorm` so device queries hit an index instead of
+ * scanning the users collection.
+ */
+function deviceKey(s) {
+  return String(s || '').trim().toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+/** One-time backfill: normalize `deviceIdNorm` for pre-existing rows. */
+async function backfillDeviceNorms(models) {
+  const missing = await models.OtpUser
+    .find({ deviceId: { $ne: null }, deviceIdNorm: null }, { deviceId: 1 })
+    .lean();
+  if (!missing.length) return 0;
+  const ops = missing.map((d) => ({
+    updateOne: { filter: { _id: d._id }, update: { $set: { deviceIdNorm: deviceKey(d.deviceId) } } },
+  }));
+  try {
+    await models.OtpUser.bulkWrite(ops, { ordered: false });
+  } catch (e) {
+    // Non-fatal: lookups still work, just slower for un-backfilled rows.
+    console.warn('[mongo] deviceIdNorm backfill incomplete:', e && e.message);
+    return 0;
+  }
+  console.log(`[mongo] backfilled deviceIdNorm for ${missing.length} user(s).`);
+  return missing.length;
+}
 
 async function getModels() {
   const mongoose = await ensureMongo();
@@ -51,6 +81,13 @@ async function getModels() {
     { collection: 'users', versionKey: false, strict: true }
   );
   userSchema.index({ email: 1 }, { sparse: true, unique: true });
+  // Login $or branch: { email } | { phone } — each branch needs its own index.
+  userSchema.index({ phone: 1 }, { sparse: true });
+  // Admin user list: { role: $in:[user,free] } + sort { id: -1 }.
+  userSchema.index({ role: 1, id: -1 });
+  // Dashboard active-subscription count: role + packageExpireDate range
+  // (ISO strings compare lexicographically; $ne currentPackageId filtered).
+  userSchema.index({ role: 1, packageExpireDate: 1 });
   userSchema.index({ deviceIdNorm: 1 }, { sparse: true });
 
   const packageSchema = new Schema(
@@ -66,6 +103,8 @@ async function getModels() {
     },
     { collection: 'packages', versionKey: false, strict: true }
   );
+  // User catalog: { status: 'active' } + sort { price: 1 }.
+  packageSchema.index({ status: 1, price: 1 });
 
   const methodSchema = new Schema(
     {
@@ -82,6 +121,8 @@ async function getModels() {
     },
     { collection: 'paymentmethods', versionKey: false, strict: true }
   );
+  // User catalog: { status: 'active' } + sort { sortOrder: 1 }.
+  methodSchema.index({ status: 1, sortOrder: 1 });
 
   const paymentSchema = new Schema(
     {
@@ -114,6 +155,9 @@ async function getModels() {
   );
   paymentSchema.index({ userId: 1, id: -1 });
   paymentSchema.index({ status: 1, id: -1 });
+  // Delete guards: pending references per package / payment method.
+  paymentSchema.index({ packageId: 1, status: 1 });
+  paymentSchema.index({ paymentMethodId: 1, status: 1 });
 
   const subscriptionSchema = new Schema(
     {
@@ -161,7 +205,9 @@ async function getModels() {
     },
     { collection: 'notifications', versionKey: false, strict: true }
   );
-  notificationSchema.index({ id: -1 });
+  // Latest-first list (sort { id: -1 } served by the unique id index) +
+  // unread badge count ({ read: false }). Compound serves both.
+  notificationSchema.index({ read: 1, id: -1 });
 
   const fcmSchema = new Schema(
     {
@@ -217,7 +263,17 @@ async function getModels() {
   // Ensure indexes exist (safe to call repeatedly).
   await Promise.all(Object.values(cached).map((m) => m.syncIndexes().catch(() => null)));
 
+  // One-time data repair so indexed device lookups cover legacy rows.
+  if (!backfilled) {
+    backfilled = true;
+    try {
+      await backfillDeviceNorms(cached);
+    } catch (e) {
+      console.warn('[mongo] backfill skipped:', e && e.message);
+    }
+  }
+
   return cached;
 }
 
-module.exports = { getModels };
+module.exports = { getModels, deviceKey };

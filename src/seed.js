@@ -159,16 +159,20 @@ async function main() {
   await ensureMongo();
   const models = await getModels();
   await ensureAdmin(models);
-  await ensurePackages(models);
-  await ensureMethods(models);
-  await ensureVersion(models);
-  await ensureSampleUsers(models);
-  const counts = {
-    users: await models.OtpUser.countDocuments(),
-    packages: await models.OtpPackage.countDocuments(),
-    paymentMethods: await models.OtpMethod.countDocuments(),
-    appVersions: await models.OtpVersion.countDocuments(),
-  };
+  // Independent collections — seed concurrently.
+  await Promise.all([
+    ensurePackages(models),
+    ensureMethods(models),
+    ensureVersion(models),
+    ensureSampleUsers(models),
+  ]);
+  const [users, packages, paymentMethods, appVersions] = await Promise.all([
+    models.OtpUser.estimatedDocumentCount(),
+    models.OtpPackage.estimatedDocumentCount(),
+    models.OtpMethod.estimatedDocumentCount(),
+    models.OtpVersion.estimatedDocumentCount(),
+  ]);
+  const counts = { users, packages, paymentMethods, appVersions };
   console.log(`[seed] done -> mongodb db="${getDbName()}"`, JSON.stringify(counts));
   const { closeMongo } = require('./mongo');
   await closeMongo();

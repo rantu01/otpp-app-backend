@@ -81,7 +81,7 @@ app.get('/api/versions/check', ah(async (req, res) => {
   await ensureMongo();
   const platform = String(req.query.platform || 'android').toLowerCase();
   const installed = String(req.query.version || '0');
-  const v = (await store.findVersion(platform)) || (await store.listVersions())[0] || null;
+  const v = (await store.findVersion(platform)) || (await store.findFirstVersion()) || null;
   if (!v) return res.json({ success: true, forceUpdate: false, installed });
   const belowMin = store.cmpVersions(installed, v.minimumSupportedVersion) < 0;
   const behind = store.cmpVersions(installed, v.latestVersion) < 0;
@@ -105,26 +105,35 @@ app.post('/api/auth/register', ah(async (req, res) => {
   if (!password || String(password).length < 4) return safeError(res, 400, 'Password must be at least 4 characters.');
   const login = String(email || phone || '').trim().toLowerCase();
   if (!login) return safeError(res, 400, 'Email or phone is required.');
-  if (await store.userLoginExists(login)) {
+  if (await store.loginExists(login)) {
     return safeError(res, 409, 'Account already exists. Please login.');
   }
-  const user = await store.createUser({
-    name: String(name || login.split('@')[0] || 'User'),
-    email: String(email || '').trim() || null,
-    phone: String(phone || '').trim() || null,
-    passwordHash: hashPassword(password),
-    role: 'user',
-    // New accounts stay unusable until an admin approves them:
-    // evaluateAccess() returns PENDING, clients must block Home/packages.
-    // Approval (payment approve or manual access PATCH) flips status to active.
-    status: 'pending',
-    accessEnabled: true,
-    currentPackageId: null,
-    currentPackageName: null,
-    packageStartDate: null,
-    packageExpireDate: null,
-    createdAt: store.nowIso(),
-  });
+  let user;
+  try {
+    user = await store.createUser({
+      name: String(name || login.split('@')[0] || 'User'),
+      email: String(email || '').trim() || null,
+      phone: String(phone || '').trim() || null,
+      passwordHash: hashPassword(password),
+      role: 'user',
+      // New accounts stay unusable until an admin approves them:
+      // evaluateAccess() returns PENDING, clients must block Home/packages.
+      // Approval (payment approve or manual access PATCH) flips status to active.
+      status: 'pending',
+      accessEnabled: true,
+      currentPackageId: null,
+      currentPackageName: null,
+      packageStartDate: null,
+      packageExpireDate: null,
+      createdAt: store.nowIso(),
+    });
+  } catch (e) {
+    // Lost a registration race — same outcome as the pre-check above.
+    if (e && e.code === 'DUPLICATE_LOGIN') {
+      return safeError(res, 409, 'Account already exists. Please login.');
+    }
+    throw e;
+  }
   res.status(201).json({ success: true, token: signToken(user), user: publicUser(user), access: evaluateAccess(null, user) });
 }));
 
@@ -134,7 +143,11 @@ app.post('/api/auth/login', ah(async (req, res) => {
   if (!key || !password) return safeError(res, 400, 'Login and password are required.');
   // .env is the source of truth: admin login works from ADMIN_EMAIL /
   // ADMIN_PASSWORD even if seed was never run (DB auto-syncs here).
-  await syncAdminFromEnv();
+  // Sync runs ONLY for the admin login itself — regular user logins skip it
+  // (it used to cost up to 3 extra queries on every login).
+  if (key === String(process.env.ADMIN_EMAIL || '').trim().toLowerCase()) {
+    await syncAdminFromEnv();
+  }
   const user = await store.findUserByLogin(key);
   if (!user || !verifyPassword(password, user.passwordHash)) {
     return safeError(res, 401, 'Invalid login or password.');
@@ -157,18 +170,19 @@ app.post('/api/auth/login', ah(async (req, res) => {
       return safeError(res, 403, denied.message, { code: denied.reason, access: denied });
     }
     if (!user.deviceId && reqDevice) {
-      const updated = await store.updateUserById(user.id, { deviceId: reqDevice });
+      const updated = await store.updateUserById(user.id, { deviceId: reqDevice, deviceIdNorm: store.deviceKey(reqDevice) });
       return res.json({ success: true, token: signToken(updated), user: publicUser(updated), access: evaluateAccess(null, updated) });
     }
   }
   res.json({ success: true, token: signToken(user), user: publicUser(user), access });
 }));
 
-app.get('/api/auth/me', notBlockedRequired, ah(async (req, res) => {
-  const fresh = await store.findUserById(req.user.id);
-  if (!fresh) return safeError(res, 401, 'Account not found.', { code: 'NO_ACCOUNT' });
-  res.json({ success: true, user: publicUser(fresh), access: evaluateAccess(null, fresh) });
-}));
+app.get('/api/auth/me', notBlockedRequired, (req, res) => {
+  // req.user was loaded fresh from MongoDB by the auth middleware in this
+  // same request — no second fetch needed.
+  if (!req.user) return safeError(res, 401, 'Account not found.', { code: 'NO_ACCOUNT' });
+  res.json({ success: true, user: publicUser(req.user), access: evaluateAccess(null, req.user) });
+});
 
 // Device activation (User App first-run flow, no password).
 // POST /api/auth/device { deviceId } -> finds the device account or creates a
@@ -239,7 +253,7 @@ app.post('/api/auth/activate', ah(async (req, res) => {
     status: 'pending',
     accessEnabled: true,
     deviceId,
-    deviceIdNorm: null,
+    deviceIdNorm: store.deviceKey(deviceId),
     currentPackageId: null,
     currentPackageName: null,
     packageStartDate: null,
@@ -266,12 +280,12 @@ app.get('/api/activation/status', ah(async (req, res) => {
 // immediate 403 (with the access object) even with a valid JWT, so an
 // already-open OTP modal cannot keep working after an admin disables
 // the user. PENDING / NO_PACKAGE accounts pass through with 200.
-app.get('/api/access/status', notBlockedRequired, ah(async (req, res) => {
-  const fresh = await store.findUserById(req.user.id);
-  if (!fresh) return safeError(res, 401, 'Account not found.', { code: 'NO_ACCOUNT' });
-  const access = evaluateAccess(null, fresh);
-  res.json({ success: true, access, user: publicUser(fresh) });
-}));
+app.get('/api/access/status', notBlockedRequired, (req, res) => {
+  // Same-request fresh user from the middleware — no second fetch needed.
+  if (!req.user) return safeError(res, 401, 'Account not found.', { code: 'NO_ACCOUNT' });
+  const access = evaluateAccess(null, req.user);
+  res.json({ success: true, access, user: publicUser(req.user) });
+});
 
 // Example protected API: disabled/expired users are blocked here.
 app.get('/api/protected/demo', accessRequired, (req, res) => {
@@ -311,14 +325,17 @@ app.post('/api/payments', notBlockedRequired, ah(async (req, res) => {
     }
   }
 
-  const pkg = await store.findPackageById(Number(packageId));
+  // Independent lookups, concurrently (was 3 sequential round trips).
+  const norm = store.normalizeTxid(txid);
+  const [pkg, method, dup] = await Promise.all([
+    store.findPackageById(Number(packageId)),
+    store.findMethodById(Number(paymentMethodId)),
+    store.findDuplicateTxid(norm),
+  ]);
   if (!pkg || pkg.status !== 'active') return safeError(res, 400, 'Invalid or inactive package.');
-  const method = await store.findMethodById(Number(paymentMethodId));
   if (!method || method.status !== 'active') return safeError(res, 400, 'Invalid or inactive payment method.');
 
   // Backend duplicate-transaction guard (source of truth, not frontend).
-  const norm = store.normalizeTxid(txid);
-  const dup = await store.findDuplicateTxid(norm);
   if (dup) return safeError(res, 409, 'This Transaction ID has already been submitted.', { code: 'DUPLICATE_TXID' });
 
   let payment;
@@ -349,14 +366,17 @@ app.post('/api/payments', notBlockedRequired, ah(async (req, res) => {
     }
     throw e;
   }
-  if (idemKey) await store.saveIdemKey(idemKey, payment.id);
-  // Admin notification (Admin App polls this; push fan-out below).
-  await store.createNotification({
-    type: 'NEW_PAYMENT',
-    title: 'New payment received for verification',
-    message: `${req.user.name} paid ${pkg.price} for ${pkg.name} via ${method.name} (TxID ${txid})`,
-    paymentRequestId: payment.id,
-  });
+  // Independent writes, concurrently.
+  await Promise.all([
+    idemKey ? store.saveIdemKey(idemKey, payment.id) : Promise.resolve(),
+    // Admin notification (Admin App polls this; push fan-out below).
+    store.createNotification({
+      type: 'NEW_PAYMENT',
+      title: 'New payment received for verification',
+      message: `${req.user.name} paid ${pkg.price} for ${pkg.name} via ${method.name} (TxID ${txid})`,
+      paymentRequestId: payment.id,
+    }),
+  ]);
   await pushToAdmins(`New payment: ${pkg.name} / TxID ${txid}`);
   res.status(201).json({ success: true, payment });
 }));
@@ -367,8 +387,11 @@ app.get('/api/payments/mine', notBlockedRequired, ah(async (req, res) => {
 }));
 
 app.get('/api/subscriptions/mine', notBlockedRequired, ah(async (req, res) => {
-  const list = await store.listUserSubscriptions(req.user.id);
-  const user = await store.findUserById(req.user.id);
+  // Independent reads, concurrently.
+  const [list, user] = await Promise.all([
+    store.listUserSubscriptions(req.user.id),
+    store.findUserById(req.user.id),
+  ]);
   res.json({ success: true, subscriptions: list, current: user ? {
     packageId: user.currentPackageId, packageName: user.currentPackageName,
     start: user.packageStartDate, expire: user.packageExpireDate,
@@ -390,9 +413,12 @@ app.get('/api/admin/profits', adminRequired, ah(async (req, res) => {
 }));
 
 app.get('/api/admin/withdrawals', adminRequired, ah(async (req, res) => {
-  const list = await store.listWithdrawals();
-  const profit = await store.profitSummary();
-  res.json({ success: true, withdrawals: list, profit, config: store.profitConfig() });
+  // Independent reads, concurrently.
+  const [paged, profit] = await Promise.all([
+    store.listWithdrawals(req.query),
+    store.profitSummary(),
+  ]);
+  res.json({ success: true, withdrawals: paged.withdrawals, profit, config: store.profitConfig(), total: paged.total, page: paged.page, limit: paged.limit, hasMore: paged.hasMore });
 }));
 
 // Record a payout to one of the three partners. Deducts from remaining profit.
@@ -421,13 +447,15 @@ app.post('/api/admin/withdrawals', adminRequired, ah(async (req, res) => {
     createdBy: req.user.id,
     createdAt: store.nowIso(),
   });
-  res.status(201).json({ success: true, withdrawal: record, profit: await store.profitSummary() });
+  // The payout only moves withdrawnTotal/remaining — derive the fresh profit
+  // from the snapshot instead of re-running the full rollup.
+  res.status(201).json({ success: true, withdrawal: record, profit: store.applyWithdrawalProfit(profit, record.amount) });
 }));
 
 // ---------------- admin: users ----------------
 app.get('/api/admin/users', adminRequired, ah(async (req, res) => {
-  const list = await store.listUsers(req.query.search);
-  res.json({ success: true, users: list.map(publicUser) });
+  const paged = await store.listUsers(req.query.search, req.query);
+  res.json({ success: true, users: paged.users.map(publicUser), total: paged.total, page: paged.page, limit: paged.limit, hasMore: paged.hasMore });
 }));
 
 // Create a user manually (admin). role: 'user' (default) or 'free' (no payment needed).
@@ -438,23 +466,31 @@ app.post('/api/admin/users', adminRequired, ah(async (req, res) => {
   if (!password || String(password).length < 4) return safeError(res, 400, 'Password must be at least 4 characters.');
   const wantRole = String(role || 'user').toLowerCase();
   if (!['user', 'free'].includes(wantRole)) return safeError(res, 400, "role must be 'user' or 'free'.");
-  if (await store.userLoginExists(login)) {
+  if (await store.loginExists(login)) {
     return safeError(res, 409, 'Account already exists.');
   }
-  const user = await store.createUser({
-    name: String(name || login.split('@')[0] || 'User'),
-    email: String(email || '').trim() || null,
-    phone: String(phone || '').trim() || null,
-    passwordHash: hashPassword(password),
-    role: wantRole,
-    status: 'active',
-    accessEnabled: true,
-    currentPackageId: null,
-    currentPackageName: wantRole === 'free' ? 'Free' : null,
-    packageStartDate: null,
-    packageExpireDate: null,
-    createdAt: store.nowIso(),
-  });
+  let user;
+  try {
+    user = await store.createUser({
+      name: String(name || login.split('@')[0] || 'User'),
+      email: String(email || '').trim() || null,
+      phone: String(phone || '').trim() || null,
+      passwordHash: hashPassword(password),
+      role: wantRole,
+      status: 'active',
+      accessEnabled: true,
+      currentPackageId: null,
+      currentPackageName: wantRole === 'free' ? 'Free' : null,
+      packageStartDate: null,
+      packageExpireDate: null,
+      createdAt: store.nowIso(),
+    });
+  } catch (e) {
+    if (e && e.code === 'DUPLICATE_LOGIN') {
+      return safeError(res, 409, 'Account already exists.');
+    }
+    throw e;
+  }
   res.status(201).json({ success: true, user: publicUser(user), access: evaluateAccess(null, user) });
 }));
 
@@ -499,15 +535,19 @@ app.patch('/api/admin/users/:id/device', adminRequired, ah(async (req, res) => {
   if (d.length < 8 || d.length > 64) return safeError(res, 400, 'Invalid Device ID.');
   const clash = await store.findUserByDevice(d);
   if (clash && clash.id !== user.id) return safeError(res, 409, 'That Device ID is already bound to another account.');
-  const updated = await store.updateUserById(user.id, { deviceId: d });
+  // deviceIdNorm is maintained alongside deviceId so lookups stay indexed.
+  const updated = await store.updateUserById(user.id, { deviceId: d, deviceIdNorm: store.deviceKey(d) });
   res.json({ success: true, user: publicUser(updated), access: evaluateAccess(null, updated) });
 }));
 
 // Manually assign/extend a package (uses the same renewal rule as approval).
 app.post('/api/admin/users/:id/assign-package', adminRequired, ah(async (req, res) => {
-  const user = await store.findUserById(Number(req.params.id));
+  // Independent reads, concurrently.
+  const [user, pkg] = await Promise.all([
+    store.findUserById(Number(req.params.id)),
+    store.findPackageById(Number(req.body.packageId)),
+  ]);
   if (!user || user.role === 'admin') return safeError(res, 404, 'User not found.');
-  const pkg = await store.findPackageById(Number(req.body.packageId));
   if (!pkg || pkg.status !== 'active') return safeError(res, 400, 'Invalid or inactive package.');
   const { start, expire } = store.activationWindow(user, pkg.durationDays, Date.now());
   const startIso = new Date(start).toISOString();
@@ -543,13 +583,13 @@ app.post('/api/admin/packages', adminRequired, ah(async (req, res) => {
   res.status(201).json({ success: true, package: pkg });
 }));
 app.put('/api/admin/packages/:id', adminRequired, ah(async (req, res) => {
-  const existing = await store.findPackageById(Number(req.params.id));
-  if (!existing) return safeError(res, 404, 'Package not found.');
   const patch = {};
   for (const k of ['name', 'description']) if (req.body[k] !== undefined) patch[k] = String(req.body[k]);
   for (const k of ['price', 'durationDays']) if (req.body[k] !== undefined) patch[k] = Number(req.body[k]);
   if (req.body.status !== undefined) patch.status = req.body.status === 'inactive' ? 'inactive' : 'active';
-  const pkg = await store.updatePackageById(existing.id, patch);
+  // Single atomic op (was read-then-write); null means not found.
+  const pkg = await store.updatePackageById(Number(req.params.id), patch);
+  if (!pkg) return safeError(res, 404, 'Package not found.');
   res.json({ success: true, package: pkg });
 }));
 
@@ -557,10 +597,9 @@ app.put('/api/admin/packages/:id', adminRequired, ah(async (req, res) => {
 // APPROVED/REJECTED payments is preserved — only the catalog entry is removed).
 app.delete('/api/admin/packages/:id', adminRequired, ah(async (req, res) => {
   const id = Number(req.params.id);
-  const existing = await store.findPackageById(id);
-  if (!existing) return safeError(res, 404, 'Package not found.');
   if (await store.hasPendingRefToPackage(id)) return safeError(res, 409, 'Cannot delete: pending payments reference this package.');
   const removed = await store.deletePackageById(id);
+  if (!removed) return safeError(res, 404, 'Package not found.');
   res.json({ success: true, removed });
 }));
 
@@ -582,30 +621,30 @@ app.post('/api/admin/payment-methods', adminRequired, ah(async (req, res) => {
   res.status(201).json({ success: true, paymentMethod: m });
 }));
 app.put('/api/admin/payment-methods/:id', adminRequired, ah(async (req, res) => {
-  const existing = await store.findMethodById(Number(req.params.id));
-  if (!existing) return safeError(res, 404, 'Payment method not found.');
   const patch = {};
   for (const k of ['name', 'walletNumber', 'accountType', 'logo', 'instructions']) {
     if (req.body[k] !== undefined) patch[k] = String(req.body[k]);
   }
   if (req.body.status !== undefined) patch.status = req.body.status === 'inactive' ? 'inactive' : 'active';
   if (req.body.sortOrder !== undefined) patch.sortOrder = Number(req.body.sortOrder);
-  const m = await store.updateMethodById(existing.id, patch);
+  // Single atomic op (was read-then-write); null means not found.
+  const m = await store.updateMethodById(Number(req.params.id), patch);
+  if (!m) return safeError(res, 404, 'Payment method not found.');
   res.json({ success: true, paymentMethod: m });
 }));
 app.delete('/api/admin/payment-methods/:id', adminRequired, ah(async (req, res) => {
   const id = Number(req.params.id);
-  const existing = await store.findMethodById(id);
-  if (!existing) return safeError(res, 404, 'Payment method not found.');
   if (await store.hasPendingRefToMethod(id)) return safeError(res, 409, 'Cannot delete: pending payments reference this method.');
   const removed = await store.deleteMethodById(id);
+  if (!removed) return safeError(res, 404, 'Payment method not found.');
   res.json({ success: true, removed });
 }));
 
 // ---------------- admin: payments verify/history ----------------
 app.get('/api/admin/payments', adminRequired, ah(async (req, res) => {
-  const { status, search } = req.query;
-  res.json({ success: true, payments: await store.listPayments({ status, search }) });
+  const { status, search, page, limit, before } = req.query;
+  const paged = await store.listPayments({ status, search, page, limit, before });
+  res.json({ success: true, payments: paged.payments, total: paged.total, page: paged.page, limit: paged.limit, hasMore: paged.hasMore });
 }));
 
 app.get('/api/admin/payments/pending-count', adminRequired, ah(async (req, res) => {
@@ -643,13 +682,17 @@ app.post('/api/admin/payments/:id/reject', adminRequired, ah(async (req, res) =>
 
 // ---------------- admin: subscriptions / notifications / versions ----------------
 app.get('/api/admin/subscriptions', adminRequired, ah(async (req, res) => {
-  res.json({ success: true, subscriptions: await store.listAllSubscriptions() });
+  const paged = await store.listAllSubscriptions(req.query);
+  res.json({ success: true, subscriptions: paged.subscriptions, total: paged.total, page: paged.page, limit: paged.limit, hasMore: paged.hasMore });
 }));
 
 app.get('/api/admin/notifications', adminRequired, ah(async (req, res) => {
-  const list = await store.listNotifications(100);
-  const unread = await store.countUnreadNotifications();
-  res.json({ success: true, notifications: list, unread });
+  // Independent reads, concurrently.
+  const [paged, unread] = await Promise.all([
+    store.listNotifications({ limit: 100 }),
+    store.countUnreadNotifications(),
+  ]);
+  res.json({ success: true, notifications: paged.notifications, unread, total: paged.total, hasMore: paged.hasMore });
 }));
 app.post('/api/admin/notifications/read-all', adminRequired, ah(async (req, res) => {
   await store.markAllNotificationsRead();
