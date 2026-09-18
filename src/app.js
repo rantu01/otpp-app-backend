@@ -70,7 +70,10 @@ app.post('/api/auth/register', (req, res) => {
     phone: String(phone || '').trim() || null,
     passwordHash: hashPassword(password),
     role: 'user',
-    status: 'active',
+    // New accounts stay unusable until an admin approves them:
+    // evaluateAccess() returns PENDING, clients must block Home/packages.
+    // Approval (payment approve or manual access PATCH) flips status to active.
+    status: 'pending',
     accessEnabled: true,
     currentPackageId: null,
     currentPackageName: null,
@@ -80,7 +83,7 @@ app.post('/api/auth/register', (req, res) => {
   };
   db.users.push(user);
   dbx.save(db);
-  res.status(201).json({ success: true, token: signToken(user), user: publicUser(user) });
+  res.status(201).json({ success: true, token: signToken(user), user: publicUser(user), access: evaluateAccess(db, user) });
 });
 
 app.post('/api/auth/login', (req, res) => {
@@ -94,7 +97,14 @@ app.post('/api/auth/login', (req, res) => {
   if (!user || !verifyPassword(password, user.passwordHash)) {
     return safeError(res, 401, 'Invalid login or password.');
   }
-  res.json({ success: true, token: signToken(user), user: publicUser(user) });
+  // Account-level gate: pending/disabled/blocked accounts cannot log in at all,
+  // even with the right password. Active accounts without a package CAN log in
+  // (they are routed to the package/purchase flow, never to Home).
+  const access = evaluateAccess(db, user);
+  if (!access.allowed && access.reason !== 'NO_PACKAGE') {
+    return safeError(res, 403, access.message, { code: access.reason, access });
+  }
+  res.json({ success: true, token: signToken(user), user: publicUser(user), access });
 });
 
 app.get('/api/auth/me', authRequired, (req, res) => {

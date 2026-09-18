@@ -61,6 +61,9 @@ function adminRequired(req, res, next) {
 function evaluateAccess(db, user) {
   const now = Date.now();
   if (!user) return { allowed: false, reason: 'NO_ACCOUNT', message: 'Account not found.' };
+  if (user.status === 'pending') {
+    return { allowed: false, reason: 'PENDING', message: 'Your account is pending admin approval.' };
+  }
   if (user.status !== 'active') {
     return { allowed: false, reason: 'DISABLED', message: 'Your account has been disabled. Contact support.' };
   }

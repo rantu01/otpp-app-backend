@@ -32,6 +32,11 @@ backend/
   `accessRequired` middleware evaluate `status/active`, `accessEnabled`, and
   subscription expiry on every call. Blocking a user takes effect immediately,
   even with a still-valid JWT.
+- **Accounts start pending.** `POST /api/auth/register` creates users with
+  `status: 'pending'`; `POST /api/auth/login` returns `403` for
+  pending/disabled/blocked accounts (only active accounts without a package
+  may log in, and only into the purchase flow). Payment approval or a manual
+  admin access PATCH flips the account to `active`.
 - **Transaction IDs are unique.** Normalized (upper-case, spaces/dashes
   stripped) and enforced in the backend; duplicates get HTTP 409.
   `Idempotency-Key` header additionally dedupes double-tap / network retries.
