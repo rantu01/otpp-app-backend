@@ -17,7 +17,7 @@ const express = require('express');
 const cors = require('cors');
 const crypto = require('crypto');
 const dbx = require('./db');
-const { hashPassword, verifyPassword, signToken, authRequired, adminRequired, accessRequired, evaluateAccess, publicUser } = require('./auth');
+const { hashPassword, verifyPassword, signToken, authRequired, adminRequired, accessRequired, notBlockedRequired, evaluateAccess, publicUser } = require('./auth');
 
 const app = express();
 // Security first (headers + sanitizer + rate limits), then CORS + JSON.
@@ -141,9 +141,10 @@ app.post('/api/auth/login', (req, res) => {
   res.json({ success: true, token: signToken(user), user: publicUser(user), access });
 });
 
-app.get('/api/auth/me', authRequired, (req, res) => {
+app.get('/api/auth/me', notBlockedRequired, (req, res) => {
   const db = dbx.load();
   const fresh = db.users.find((u) => u.id === req.user.id);
+  if (!fresh) return safeError(res, 401, 'Account not found.', { code: 'NO_ACCOUNT' });
   res.json({ success: true, user: publicUser(fresh), access: evaluateAccess(db, fresh) });
 });
 
@@ -182,6 +183,12 @@ app.post('/api/auth/device', (req, res) => {
     dbx.save(db);
   }
   const access = evaluateAccess(db, user);
+  // Server-side kill-switch: a disabled/blocked device must NOT receive a
+  // fresh token, even if the app still holds an old JWT with an open modal.
+  // PENDING and NO_PACKAGE accounts may proceed to the purchase flow.
+  if (!access.allowed && access.reason !== 'NO_PACKAGE' && access.reason !== 'PENDING') {
+    return safeError(res, 403, access.message, { code: access.reason, access });
+  }
   res.json({ success: true, token: signToken(user), user: publicUser(user), access });
 });
 
@@ -242,9 +249,14 @@ app.get('/api/activation/status', (req, res) => {
 });
 
 // Backend-validated access status (User App startup flow calls this).
-app.get('/api/access/status', authRequired, (req, res) => {
+// Server-side kill-switch: DISABLED / ACCESS_DENIED accounts get an
+// immediate 403 (with the access object) even with a valid JWT, so an
+// already-open OTP modal cannot keep working after an admin disables
+// the user. PENDING / NO_PACKAGE accounts pass through with 200.
+app.get('/api/access/status', notBlockedRequired, (req, res) => {
   const db = dbx.load();
   const fresh = db.users.find((u) => u.id === req.user.id);
+  if (!fresh) return safeError(res, 401, 'Account not found.', { code: 'NO_ACCOUNT' });
   const access = evaluateAccess(db, fresh);
   res.json({ success: true, access, user: publicUser(fresh) });
 });
@@ -255,13 +267,15 @@ app.get('/api/protected/demo', accessRequired, (req, res) => {
 });
 
 // ---------------- user-facing catalog (active only) ----------------
-app.get('/api/packages', authRequired, (req, res) => {
+// notBlockedRequired: disabled accounts are rejected server-side (403) even
+// with a valid JWT; PENDING / NO_PACKAGE accounts may browse so they can buy.
+app.get('/api/packages', notBlockedRequired, (req, res) => {
   const db = dbx.load();
   const list = db.packages.filter((p) => p.status === 'active').sort((a, b) => a.price - b.price);
   res.json({ success: true, packages: list });
 });
 
-app.get('/api/payment-methods', authRequired, (req, res) => {
+app.get('/api/payment-methods', notBlockedRequired, (req, res) => {
   const db = dbx.load();
   const list = db.paymentMethods
     .filter((m) => m.status === 'active')
@@ -270,7 +284,9 @@ app.get('/api/payment-methods', authRequired, (req, res) => {
 });
 
 // ---------------- user: payments ----------------
-app.post('/api/payments', authRequired, (req, res) => {
+// notBlockedRequired: a disabled user cannot submit or list payments even
+// with a still-valid JWT; PENDING / NO_PACKAGE users may submit (approval path).
+app.post('/api/payments', notBlockedRequired, (req, res) => {
   const { packageId, paymentMethodId, transactionId } = req.body || {};
   const idemKey = req.headers['idempotency-key'] ? String(req.headers['idempotency-key']) : null;
   const txid = String(transactionId || '').trim();
@@ -333,13 +349,13 @@ app.post('/api/payments', authRequired, (req, res) => {
   res.status(201).json({ success: true, payment });
 });
 
-app.get('/api/payments/mine', authRequired, (req, res) => {
+app.get('/api/payments/mine', notBlockedRequired, (req, res) => {
   const db = dbx.load();
   const list = db.payments.filter((p) => p.userId === req.user.id).sort((a, b) => b.id - a.id);
   res.json({ success: true, payments: list });
 });
 
-app.get('/api/subscriptions/mine', authRequired, (req, res) => {
+app.get('/api/subscriptions/mine', notBlockedRequired, (req, res) => {
   const db = dbx.load();
   const list = db.subscriptions.filter((s) => s.userId === req.user.id).sort((a, b) => b.id - a.id);
   const user = db.users.find((u) => u.id === req.user.id);

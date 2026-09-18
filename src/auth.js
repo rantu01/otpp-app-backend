@@ -110,4 +110,30 @@ function accessRequired(req, res, next) {
   });
 }
 
-module.exports = { hashPassword, verifyPassword, signToken, authRequired, adminRequired, accessRequired, evaluateAccess, publicUser };
+/**
+ * Server-side kill-switch for disabled accounts.
+ *
+ * Blocks DISABLED / ACCESS_DENIED / NO_ACCOUNT even when the client still
+ * holds a valid JWT (e.g. OTP modal already open on the device). Unlike
+ * accessRequired() it still allows PENDING and NO_PACKAGE accounts through,
+ * so the package/purchase flow keeps working for accounts that merely lack
+ * a subscription. Every user-facing data endpoint must use this (or the
+ * stricter accessRequired), never bare authRequired, so a disabled user
+ * immediately loses backend access and cannot bypass the lockout by
+ * manipulating the client app.
+ */
+function notBlockedRequired(req, res, next) {
+  authRequired(req, res, () => {
+    if (req.user.role === 'admin') return next(); // admins bypass account gate
+    const db = req.db;
+    const fresh = db.users.find((u) => u.id === req.user.id);
+    const result = evaluateAccess(db, fresh);
+    if (!result.allowed && result.reason !== 'PENDING' && result.reason !== 'NO_PACKAGE') {
+      return res.status(403).json({ success: false, error: result.message, code: result.reason, access: result });
+    }
+    req.access = result;
+    next();
+  });
+}
+
+module.exports = { hashPassword, verifyPassword, signToken, authRequired, adminRequired, accessRequired, notBlockedRequired, evaluateAccess, publicUser };
