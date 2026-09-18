@@ -13,15 +13,22 @@ const { hashPassword } = require('./auth');
 const db = dbx.load();
 
 function ensureAdmin() {
-  const email = (process.env.ADMIN_EMAIL || 'admin@example.com').toLowerCase();
-  let admin = db.users.find((u) => u.email === email);
+  const email = (process.env.ADMIN_EMAIL || 'admin@example.com').trim().toLowerCase();
+  const password = process.env.ADMIN_PASSWORD || 'admin123';
+  const name = process.env.ADMIN_NAME || 'Administrator';
+  let admin = db.users.find((u) => u.email && u.email.toLowerCase() === email);
+  // Email bodle gele purono admin ke khuje notun email e migrate koro
+  // (nahole purono email er admin roye jay, notun ta ar kaj kore na).
+  if (!admin) {
+    admin = db.users.find((u) => u.role === 'admin');
+  }
   if (!admin) {
     admin = {
       id: dbx.nextId(db, 'user'),
-      name: process.env.ADMIN_NAME || 'Administrator',
+      name,
       email,
       phone: null,
-      passwordHash: hashPassword(process.env.ADMIN_PASSWORD || 'admin123'),
+      passwordHash: hashPassword(password),
       role: 'admin',
       status: 'active',
       accessEnabled: true,
@@ -34,7 +41,15 @@ function ensureAdmin() {
     db.users.push(admin);
     console.log('[seed] admin created:', email);
   } else {
-    console.log('[seed] admin exists:', email);
+    // Proti bar .env theke sync koro: age sudhu create hoto, password
+    // kokhono update hoto na — tai .env bodlaleo purono admin123 e thakto.
+    admin.email = email;
+    admin.name = name;
+    admin.role = 'admin';
+    admin.status = 'active';
+    admin.accessEnabled = true;
+    admin.passwordHash = hashPassword(password);
+    console.log('[seed] admin synced from .env:', email);
   }
 }
 

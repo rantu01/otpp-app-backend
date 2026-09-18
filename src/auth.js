@@ -9,6 +9,7 @@
  *   Used by protected APIs so a disabled/expired user cannot continue even
  *   with a still-valid JWT (Scenario 3 & 4).
  */
+try { require('dotenv').config(); } catch { /* dotenv optional */ }
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { load, publicUser } = require('./db');

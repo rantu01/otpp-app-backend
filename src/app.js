@@ -12,6 +12,7 @@
  *  - Package activation: renewal before expiry extends from current expiry,
  *    otherwise starts from approval date.
  */
+try { require('dotenv').config(); } catch { /* dotenv optional */ }
 const express = require('express');
 const cors = require('cors');
 const crypto = require('crypto');
@@ -95,6 +96,9 @@ app.post('/api/auth/login', (req, res) => {
   const key = String(login || email || phone || '').trim().toLowerCase();
   if (!key || !password) return safeError(res, 400, 'Login and password are required.');
   const db = dbx.load();
+  // .env ke source-of-truth dhoro: seed na chalaleo admin login .env er
+  // ADMIN_EMAIL / ADMIN_PASSWORD diyei hobe (DB auto-sync hoye jabe).
+  syncAdminFromEnv(db);
   const user = db.users.find(
     (u) => (u.email && u.email.toLowerCase() === key) || (u.phone && u.phone.toLowerCase() === key)
   );
@@ -607,6 +611,52 @@ app.put('/api/admin/versions/:platform', adminRequired, (req, res) => {
 });
 
 // ---------------- helpers ----------------
+/**
+ * Admin credentials: .env is the source of truth.
+ * DB te purono hash thakle login er somoy .env er sathe miliye auto-sync
+ * kora hoy, tai production e .env bodlale `npm run seed` na chalaleo
+ * notun password sathe sathe kaj kore. Purono password diye ar dhoka jay na.
+ */
+function syncAdminFromEnv(db) {
+  const email = (process.env.ADMIN_EMAIL || '').trim().toLowerCase();
+  const password = process.env.ADMIN_PASSWORD;
+  const name = process.env.ADMIN_NAME || 'Administrator';
+  if (!email || !password) return false;
+  let admin = db.users.find((u) => u.email && u.email.toLowerCase() === email);
+  if (!admin) admin = db.users.find((u) => u.role === 'admin');
+  if (!admin) {
+    db.users.push({
+      id: dbx.nextId(db, 'user'),
+      name,
+      email,
+      phone: null,
+      passwordHash: hashPassword(password),
+      role: 'admin',
+      status: 'active',
+      accessEnabled: true,
+      currentPackageId: null,
+      currentPackageName: null,
+      packageStartDate: null,
+      packageExpireDate: null,
+      createdAt: dbx.nowIso(),
+    });
+    dbx.save(db);
+    return true;
+  }
+  let changed = false;
+  if ((admin.email || '').toLowerCase() !== email) { admin.email = email; changed = true; }
+  if (admin.name !== name) { admin.name = name; changed = true; }
+  if (admin.role !== 'admin') { admin.role = 'admin'; changed = true; }
+  if (admin.status !== 'active') { admin.status = 'active'; changed = true; }
+  if (admin.accessEnabled !== true) { admin.accessEnabled = true; changed = true; }
+  if (!verifyPassword(password, admin.passwordHash)) {
+    admin.passwordHash = hashPassword(password);
+    changed = true;
+  }
+  if (changed) dbx.save(db);
+  return changed;
+}
+
 /**
  * Package activation rule:
  *  - renewal before expiry  => extend from current expiry date
