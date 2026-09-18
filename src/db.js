@@ -64,6 +64,15 @@ function normalizeTxid(txid) {
   return String(txid || '').trim().toUpperCase().replace(/[\s-]+/g, '');
 }
 
+/**
+ * Device IDs (Android ANDROID_ID style hex) are compared lower-cased,
+ * ignoring spaces/dashes/colons. Returns '' when invalid (valid = 6-64 hex).
+ */
+function normalizeDeviceId(deviceId) {
+  const norm = String(deviceId || '').trim().toLowerCase().replace(/[\s\-:]/g, '');
+  return /^[a-f0-9]{6,64}$/.test(norm) ? norm : '';
+}
+
 function nowIso() {
   return new Date().toISOString();
 }
@@ -87,4 +96,4 @@ function publicUser(u) {
   return rest;
 }
 
-module.exports = { DB_PATH, load, save, nextId, normalizeTxid, nowIso, cmpVersions, publicUser };
+module.exports = { DB_PATH, load, save, nextId, normalizeTxid, normalizeDeviceId, nowIso, cmpVersions, publicUser };

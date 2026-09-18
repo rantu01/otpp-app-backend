@@ -59,6 +59,7 @@ backend/
 |---|---|---|
 | POST | `/api/auth/register` | public |
 | POST | `/api/auth/login` | public |
+| POST | `/api/auth/device` | public (device activation: find-or-create PENDING device account, returns JWT + access) |
 | GET | `/api/auth/me` | user/admin |
 | GET | `/api/access/status` | user/admin |
 | GET | `/api/protected/demo` | gated (accessRequired) |

@@ -14,6 +14,7 @@
  */
 const express = require('express');
 const cors = require('cors');
+const crypto = require('crypto');
 const dbx = require('./db');
 const { hashPassword, verifyPassword, signToken, authRequired, adminRequired, accessRequired, evaluateAccess, publicUser } = require('./auth');
 
@@ -23,6 +24,9 @@ app.use(express.json({ limit: '1mb' }));
 
 const safeError = (res, status, message, extra) =>
   res.status(status).json(Object.assign({ success: false, error: message }, extra || {}));
+
+/** Device IDs: case-insensitive, punctuation-insensitive. */
+const normalizeDeviceId = (s) => String(s || '').trim().toLowerCase().replace(/[^a-z0-9]/g, '');
 
 // ---------------- public: health + version check ----------------
 app.get('/api/health', (req, res) => {
@@ -104,6 +108,20 @@ app.post('/api/auth/login', (req, res) => {
   if (!access.allowed && access.reason !== 'NO_PACKAGE') {
     return safeError(res, 403, access.message, { code: access.reason, access });
   }
+  // Device binding: a device-locked account only works from its own device.
+  // Accounts created before device binding adopt the first device they
+  // successfully log in from (password already verified above).
+  const reqDevice = normalizeDeviceId(req.body.deviceId);
+  if (user.role !== 'admin') {
+    if (user.deviceId && reqDevice && normalizeDeviceId(user.deviceId) !== reqDevice) {
+      const denied = { allowed: false, reason: 'DEVICE_MISMATCH', message: 'This account is activated on a different device. Contact admin.' };
+      return safeError(res, 403, denied.message, { code: denied.reason, access: denied });
+    }
+    if (!user.deviceId && reqDevice) {
+      user.deviceId = reqDevice;
+      dbx.save(db);
+    }
+  }
   res.json({ success: true, token: signToken(user), user: publicUser(user), access });
 });
 
@@ -111,6 +129,100 @@ app.get('/api/auth/me', authRequired, (req, res) => {
   const db = dbx.load();
   const fresh = db.users.find((u) => u.id === req.user.id);
   res.json({ success: true, user: publicUser(fresh), access: evaluateAccess(db, fresh) });
+});
+
+// Device activation (User App first-run flow, no password).
+// POST /api/auth/device { deviceId } -> finds the device account or creates a
+// PENDING one, and returns a JWT + live access state. The token only opens the
+// package/purchase flow until an admin approves (same gate as accounts).
+// Email/phone register+login below are preserved unchanged for admin surfaces.
+app.post('/api/auth/device', (req, res) => {
+  const norm = dbx.normalizeDeviceId((req.body || {}).deviceId);
+  if (!norm) {
+    return safeError(res, 400, 'A valid Device ID is required.', { code: 'BAD_DEVICE_ID' });
+  }
+  const db = dbx.load();
+  let user = db.users.find((u) => u.deviceIdNorm === norm && u.role !== 'admin');
+  if (!user) {
+    user = {
+      id: dbx.nextId(db, 'user'),
+      name: 'Device ' + norm.slice(0, 8),
+      email: null,
+      phone: null,
+      // Unhashable random secret: this account can never log in by password.
+      passwordHash: hashPassword('dev-locked-' + norm + '-' + Date.now() + '-' + Math.random()),
+      role: 'user',
+      status: 'pending',
+      accessEnabled: true,
+      deviceId: norm,
+      deviceIdNorm: norm,
+      currentPackageId: null,
+      currentPackageName: null,
+      packageStartDate: null,
+      packageExpireDate: null,
+      createdAt: dbx.nowIso(),
+    };
+    db.users.push(user);
+    dbx.save(db);
+  }
+  const access = evaluateAccess(db, user);
+  res.json({ success: true, token: signToken(user), user: publicUser(user), access });
+});
+
+// ---------------- device activation (User App first-run screen) ----------------
+// Public: the device ID itself is the claim. New devices get a PENDING account
+// (unusable until admin approval, exactly like register). Known devices get a
+// fresh token unless the account itself is blocked (403, no bypass).
+app.post('/api/auth/activate', (req, res) => {
+  const deviceId = normalizeDeviceId(req.body && req.body.deviceId);
+  if (!deviceId || deviceId.length < 8 || deviceId.length > 64) {
+    return safeError(res, 400, 'A valid Device ID is required.');
+  }
+  const db = dbx.load();
+  let user = db.users.find((u) => u.deviceId && normalizeDeviceId(u.deviceId) === deviceId);
+  if (user) {
+    if (user.role === 'admin') return safeError(res, 403, 'Admins cannot activate the User App.');
+    const access = evaluateAccess(db, user);
+    if (!access.allowed && access.reason !== 'NO_PACKAGE' && access.reason !== 'PENDING') {
+      return safeError(res, 403, access.message, { code: access.reason, access });
+    }
+    return res.json({ success: true, registered: true, token: signToken(user), user: publicUser(user), access });
+  }
+  const id = dbx.nextId(db, 'user');
+  user = {
+    id,
+    name: 'Device ' + deviceId.slice(0, 8),
+    email: null,
+    phone: null,
+    // Random unguessable secret: device accounts authenticate via their
+    // device ID (this endpoint) and can never log in with a password.
+    passwordHash: hashPassword(crypto.randomBytes(32).toString('hex')),
+    role: 'user',
+    status: 'pending',
+    accessEnabled: true,
+    deviceId,
+    currentPackageId: null,
+    currentPackageName: null,
+    packageStartDate: null,
+    packageExpireDate: null,
+    createdAt: dbx.nowIso(),
+  };
+  db.users.push(user);
+  dbx.save(db);
+  res.status(201).json({ success: true, registered: false, token: signToken(user), user: publicUser(user), access: evaluateAccess(db, user) });
+});
+
+// Public activation lookup: lets the app show "pending admin approval" state
+// for a device without holding a token.
+app.get('/api/activation/status', (req, res) => {
+  const deviceId = normalizeDeviceId(req.query.deviceId);
+  if (!deviceId) return safeError(res, 400, 'deviceId is required.');
+  const db = dbx.load();
+  const user = db.users.find((u) => u.deviceId && normalizeDeviceId(u.deviceId) === deviceId);
+  if (!user) {
+    return res.json({ success: true, registered: false, access: { allowed: false, reason: 'NO_ACCOUNT', message: 'Device not registered.' } });
+  }
+  res.json({ success: true, registered: true, access: evaluateAccess(db, user), user: publicUser(user) });
 });
 
 // Backend-validated access status (User App startup flow calls this).
@@ -172,6 +284,7 @@ app.post('/api/payments', authRequired, (req, res) => {
     userId: req.user.id,
     userName: req.user.name,
     userEmail: req.user.email,
+    deviceId: req.user.deviceIdNorm || req.user.deviceId || null,
     packageId: pkg.id,
     packageName: pkg.name,
     amount: pkg.price,
@@ -262,6 +375,25 @@ app.patch('/api/admin/users/:id/access', adminRequired, (req, res) => {
   res.json({ success: true, user: publicUser(user), access: evaluateAccess(db, user) });
 });
 
+// Re-bind or clear a user's device (device change / reinstall support).
+app.patch('/api/admin/users/:id/device', adminRequired, (req, res) => {
+  const db = dbx.load();
+  const user = db.users.find((u) => u.id === Number(req.params.id));
+  if (!user || user.role === 'admin') return safeError(res, 404, 'User not found.');
+  const raw = req.body.deviceId;
+  if (raw === null || raw === undefined || String(raw).trim() === '') {
+    user.deviceId = null;
+  } else {
+    const d = normalizeDeviceId(raw);
+    if (d.length < 8 || d.length > 64) return safeError(res, 400, 'Invalid Device ID.');
+    const clash = db.users.find((u) => u.id !== user.id && u.deviceId && normalizeDeviceId(u.deviceId) === d);
+    if (clash) return safeError(res, 409, 'That Device ID is already bound to another account.');
+    user.deviceId = d;
+  }
+  dbx.save(db);
+  res.json({ success: true, user: publicUser(user), access: evaluateAccess(db, user) });
+});
+
 // Manually assign/extend a package (uses the same renewal rule as approval).
 app.post('/api/admin/users/:id/assign-package', adminRequired, (req, res) => {
   const db = dbx.load();
@@ -279,6 +411,7 @@ app.post('/api/admin/users/:id/assign-package', adminRequired, (req, res) => {
     packageName: pkg.name, price: pkg.price, durationDays: pkg.durationDays,
     startDate: user.packageStartDate, expireDate: user.packageExpireDate,
     status: 'active', paymentRequestId: null, createdAt: dbx.nowIso(), createdBy: req.user.id,
+    deviceId: user.deviceIdNorm || user.deviceId || null,
   };
   db.subscriptions.push(sub);
   dbx.save(db);
@@ -401,6 +534,7 @@ app.post('/api/admin/payments/:id/approve', adminRequired, (req, res) => {
     packageName: pkg.name, price: payment.amount, durationDays: pkg.durationDays,
     startDate: user.packageStartDate, expireDate: user.packageExpireDate,
     status: 'active', paymentRequestId: payment.id, createdAt: dbx.nowIso(), createdBy: req.user.id,
+    deviceId: user.deviceIdNorm || user.deviceId || null,
   };
   db.subscriptions.push(sub);
   dbx.save(db); // single synchronous write => only one approval can win
