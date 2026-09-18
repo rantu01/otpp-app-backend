@@ -2,17 +2,16 @@
 /**
  * Auth helpers: password hashing, JWT, and middleware.
  *
- * Roles: user | admin  (stored on user.role)
- * - authRequired: any logged-in account.
+ * Roles: user | admin | free  (stored on user.role)
+ * - authRequired: any logged-in account (user loaded fresh from MongoDB).
  * - adminRequired: role === 'admin'.
- * - accessRequired: user account active + accessEnabled + active subscription.
- *   Used by protected APIs so a disabled/expired user cannot continue even
- *   with a still-valid JWT (Scenario 3 & 4).
+ * - accessRequired: active + accessEnabled + active subscription.
+ * - notBlockedRequired: kill-switch for DISABLED / ACCESS_DENIED accounts.
  */
 try { require('dotenv').config(); } catch { /* dotenv optional */ }
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const { load, publicUser } = require('./db');
+const store = require('./store');
 
 const JWT_SECRET = process.env.JWT_SECRET || 'change-me-to-a-long-random-secret';
 const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || '30d';
@@ -30,22 +29,26 @@ function verifyPassword(pw, hash) {
 function signToken(user) {
   return jwt.sign({ sub: user.id, role: user.role }, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN });
 }
+function publicUser(u) {
+  return store.publicUser(u);
+}
 
-function authRequired(req, res, next) {
+async function authRequired(req, res, next) {
   const h = req.headers.authorization || '';
   const token = h.startsWith('Bearer ') ? h.slice(7) : null;
   if (!token) return res.status(401).json({ success: false, error: 'Not authenticated' });
   try {
     const payload = jwt.verify(token, JWT_SECRET);
-    const db = load();
-    const user = db.users.find((u) => u.id === Number(payload.sub));
+    const user = await store.findUserById(Number(payload.sub));
     if (!user) return res.status(401).json({ success: false, error: 'Account not found' });
     req.auth = payload;
     req.user = user;
-    req.db = db;
     next();
   } catch (e) {
-    return res.status(401).json({ success: false, error: 'Session expired. Please login again.' });
+    if (e && (e.name === 'JsonWebTokenError' || e.name === 'TokenExpiredError')) {
+      return res.status(401).json({ success: false, error: 'Session expired. Please login again.' });
+    }
+    return res.status(500).json({ success: false, error: 'Authentication failed. Please retry.' });
   }
 }
 
@@ -59,7 +62,8 @@ function adminRequired(req, res, next) {
 }
 
 /** Backend source-of-truth access evaluation for one user record. */
-function evaluateAccess(db, user) {
+function evaluateAccess(dbOrNull, user) {
+  void dbOrNull;
   const now = Date.now();
   if (!user) return { allowed: false, reason: 'NO_ACCOUNT', message: 'Account not found.' };
   if (user.status === 'pending') {
@@ -71,7 +75,6 @@ function evaluateAccess(db, user) {
   if (user.accessEnabled === false) {
     return { allowed: false, reason: 'ACCESS_DENIED', message: 'Access has been disabled by admin.' };
   }
-  // Free role: admin-granted complimentary access, no payment/package needed.
   if (user.role === 'free') {
     return {
       allowed: true,
@@ -100,8 +103,8 @@ function evaluateAccess(db, user) {
 /** Blocks disabled/expired users from protected APIs even with a valid JWT. */
 function accessRequired(req, res, next) {
   authRequired(req, res, () => {
-    if (req.user.role === 'admin') return next(); // admins bypass subscription gate
-    const result = evaluateAccess(req.db, req.user);
+    if (req.user.role === 'admin') return next();
+    const result = evaluateAccess(null, req.user);
     if (!result.allowed) {
       return res.status(403).json({ success: false, error: result.message, code: result.reason, access: result });
     }
@@ -111,23 +114,14 @@ function accessRequired(req, res, next) {
 }
 
 /**
- * Server-side kill-switch for disabled accounts.
- *
- * Blocks DISABLED / ACCESS_DENIED / NO_ACCOUNT even when the client still
- * holds a valid JWT (e.g. OTP modal already open on the device). Unlike
- * accessRequired() it still allows PENDING and NO_PACKAGE accounts through,
- * so the package/purchase flow keeps working for accounts that merely lack
- * a subscription. Every user-facing data endpoint must use this (or the
- * stricter accessRequired), never bare authRequired, so a disabled user
- * immediately loses backend access and cannot bypass the lockout by
- * manipulating the client app.
+ * Server-side kill-switch for disabled accounts. Allows PENDING and
+ * NO_PACKAGE through (purchase flow); blocks DISABLED / ACCESS_DENIED /
+ * NO_ACCOUNT even with a valid JWT.
  */
 function notBlockedRequired(req, res, next) {
   authRequired(req, res, () => {
-    if (req.user.role === 'admin') return next(); // admins bypass account gate
-    const db = req.db;
-    const fresh = db.users.find((u) => u.id === req.user.id);
-    const result = evaluateAccess(db, fresh);
+    if (req.user.role === 'admin') return next();
+    const result = evaluateAccess(null, req.user);
     if (!result.allowed && result.reason !== 'PENDING' && result.reason !== 'NO_PACKAGE') {
       return res.status(403).json({ success: false, error: result.message, code: result.reason, access: result });
     }

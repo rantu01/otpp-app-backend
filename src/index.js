@@ -1,13 +1,22 @@
 'use strict';
 try { require('dotenv').config(); } catch { /* dotenv optional */ }
-// Optional MongoDB hookup (non-blocking, JSON-store fallback preserved).
-try { require('./mongo').connectBestEffort(); } catch (e) {
-  console.warn('[mongo] hookup skipped:', e && e.message);
-}
+const { ensureMongo } = require('./mongo');
 const app = require('./app');
 
 const PORT = Number(process.env.PORT || 4000);
-app.listen(PORT, () => {
-  console.log(`[backend] listening on http://localhost:${PORT}`);
-  console.log('[backend] health: GET /api/health');
-});
+
+// Connect to the single shared MongoDB database BEFORE accepting traffic,
+// so the very first request already reads/writes MongoDB (no local store).
+ensureMongo()
+  .catch((e) => {
+    console.error('[backend] FATAL: cannot connect to MongoDB:', e && e.message);
+    console.error('[backend] Set MONGODB_URI in `.env` (see .env.example). Refusing to start without the database.');
+    process.exit(1);
+  })
+  .then(() => {
+    app.listen(PORT, () => {
+      console.log(`[backend] listening on http://localhost:${PORT}`);
+      console.log('[backend] health: GET /api/health');
+      console.log('[backend] storage: MongoDB only (no local files).');
+    });
+  });

@@ -1,7 +1,7 @@
 # Shared Backend — Rantu_OTP access / package / payment system
 
 Single backend used by **User App**, **Admin App** and **Admin Website**
-(all three talk to the same REST API + the same `db.json` database file, so a
+(all three talk to the same REST API + the same MongoDB database, so a
 change from either admin platform is visible on the other after re-fetch).
 
 ## Quick start
@@ -21,10 +21,16 @@ Default admin: `ADMIN_EMAIL` / `ADMIN_PASSWORD` from `.env` (example: `admin@exa
 
 ```
 backend/
-  package.json  .env.example  README.md  db.json (created at runtime)
+  package.json  .env.example  README.md
   src/
-    index.js  app.js  auth.js  db.js  seed.js  smoke.js
+    index.js  app.js  auth.js  db.js  models.js  store.js  mongo.js  seed.js  smoke.js
 ```
+
+All application data is stored directly in MongoDB (database `MONGO_DB_NAME`,
+connection `MONGODB_URI` from `.env`) as JSON-compatible documents. There is
+no local file store: the backend never creates folders/files for persistent
+data, and every CRUD operation goes through the models in `src/models.js` via
+`src/store.js` (single shared connection with pooling, see `src/mongo.js`).
 
 ## Business rules
 
@@ -76,7 +82,8 @@ backend/
 | POST | `/api/admin/fcm-tokens` | admin app |
 | GET/PUT | `/api/admin/versions`, `/:platform` | admin |
 
-## Moving to Postgres/SQLite later
+## Storage notes
 
-Replace `src/db.js` (keep its exported function names) with a real driver;
-routes already depend only on that interface.
+`src/db.js` now only holds pure helpers (normalization, version compare,
+access-shape helpers). All persistence lives in MongoDB via `src/store.js` +
+`src/models.js`; routes depend on that interface.
