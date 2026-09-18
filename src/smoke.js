@@ -46,7 +46,8 @@ async function main() {
   check('admin login', adminLogin.status === 200 && adminLogin.json.token, JSON.stringify(adminLogin.json).slice(0, 120));
   const adminTok = adminLogin.json.token;
 
-  const reg = await call(port, 'POST', '/api/auth/register', { name: 'Rahim', email: 'rahim' + Date.now() + '@t.com', password: 'pass1234' });
+  const rahimEmail = 'rahim' + Date.now() + '@t.com';
+  const reg = await call(port, 'POST', '/api/auth/register', { name: 'Rahim', email: rahimEmail, password: 'pass1234' });
   check('user register', reg.status === 201 && reg.json.token, 'status=' + reg.status);
   const userTok = reg.json.token;
 
