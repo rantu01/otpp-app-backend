@@ -71,6 +71,18 @@ function evaluateAccess(db, user) {
   if (user.accessEnabled === false) {
     return { allowed: false, reason: 'ACCESS_DENIED', message: 'Access has been disabled by admin.' };
   }
+  // Free role: admin-granted complimentary access, no payment/package needed.
+  if (user.role === 'free') {
+    return {
+      allowed: true,
+      reason: 'FREE',
+      message: 'Free access granted.',
+      packageId: user.currentPackageId || null,
+      packageName: user.currentPackageName || 'Free',
+      packageExpireDate: user.packageExpireDate || null,
+      free: true,
+    };
+  }
   const exp = user.packageExpireDate ? Date.parse(user.packageExpireDate) : NaN;
   if (!user.currentPackageId || Number.isNaN(exp) || exp <= now) {
     return { allowed: false, reason: 'NO_PACKAGE', message: 'No active package. Please choose a package.' };

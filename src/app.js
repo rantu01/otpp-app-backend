@@ -20,7 +20,18 @@ const dbx = require('./db');
 const { hashPassword, verifyPassword, signToken, authRequired, adminRequired, accessRequired, evaluateAccess, publicUser } = require('./auth');
 
 const app = express();
-app.use(cors());
+// Security first (headers + sanitizer + rate limits), then CORS + JSON.
+// CORS allow-list via CORS_ORIGIN env; empty preserves the previous allow-all dev behaviour.
+const { installSecurity } = require('./security');
+const sec = installSecurity(app, cors);
+{
+  const allowed = sec.corsAllowList;
+  if (allowed && allowed.length) {
+    app.use(cors({ origin: allowed, credentials: false }));
+  } else {
+    app.use(cors());
+  }
+}
 app.use(express.json({ limit: '1mb' }));
 
 const safeError = (res, status, message, extra) =>
@@ -108,6 +119,7 @@ app.post('/api/auth/login', (req, res) => {
   // Account-level gate: pending/disabled/blocked accounts cannot log in at all,
   // even with the right password. Active accounts without a package CAN log in
   // (they are routed to the package/purchase flow, never to Home).
+  // Free-role accounts bypass the package requirement entirely.
   const access = evaluateAccess(db, user);
   if (!access.allowed && access.reason !== 'NO_PACKAGE') {
     return safeError(res, 403, access.message, { code: access.reason, access });
@@ -348,11 +360,64 @@ app.get('/api/admin/dashboard', adminRequired, (req, res) => {
   const revenue = approved.reduce((s, p) => s + (Number(p.amount) || 0), 0);
   const active = db.users.filter((u) => u.role !== 'admin' && u.currentPackageId && u.packageExpireDate && Date.parse(u.packageExpireDate) > now).length;
   const expired = db.users.filter((u) => u.role !== 'admin' && (!u.currentPackageId || !u.packageExpireDate || Date.parse(u.packageExpireDate) <= now)).length;
+  const profit = dbx.profitSummary(db);
   res.json({ success: true, stats: {
     totalPayments: payments.length, pending, approved: approved.length, rejected,
     approvedRevenue: revenue, activeSubscriptions: active, expiredSubscriptions: expired,
     totalUsers: db.users.filter((u) => u.role !== 'admin').length,
-  } });
+    dailyProfit: profit.daily, weeklyProfit: profit.weekly, totalProfit: profit.total,
+    withdrawnTotal: profit.withdrawnTotal, remainingProfit: profit.remaining,
+    withdrawalCount: profit.withdrawalCount,
+  }, profit });
+});
+
+// ---------------- admin: profit & withdrawals (transparent split ledger) ----------------
+// Profit = APPROVED payments only. Withdrawals deduct from the remaining pool.
+// Splits: Alamin 20% / Rantu 40% / Rony 40% (env-overridable, see profitConfig).
+app.get('/api/admin/profits', adminRequired, (req, res) => {
+  const db = req.db;
+  const profit = dbx.profitSummary(db);
+  res.json({ success: true, profit, config: dbx.profitConfig() });
+});
+
+app.get('/api/admin/withdrawals', adminRequired, (req, res) => {
+  const db = req.db;
+  const list = [...(db.withdrawals || [])].sort((a, b) => b.id - a.id);
+  const profit = dbx.profitSummary(db);
+  res.json({ success: true, withdrawals: list, profit, config: dbx.profitConfig() });
+});
+
+// Record a payout to one of the three partners. Deducts from remaining profit.
+app.post('/api/admin/withdrawals', adminRequired, (req, res) => {
+  const { person, phone, amount, note } = req.body || {};
+  const sum = Number(amount);
+  if (!Number.isFinite(sum) || sum <= 0) return safeError(res, 400, 'A positive amount is required.');
+  const people = dbx.profitConfig();
+  const who = people.find((p) => p.key === String(person || '').toLowerCase() || p.name.toLowerCase() === String(person || '').toLowerCase());
+  if (!who) return safeError(res, 400, 'person must be one of: alamin, rantu, rony.');
+  const db = dbx.load();
+  const profit = dbx.profitSummary(db);
+  if (sum > profit.remaining) {
+    return safeError(res, 409, `Insufficient remaining profit (৳${profit.remaining}).`, { remaining: profit.remaining });
+  }
+  const record = {
+    id: dbx.nextId(db, 'withdrawal'),
+    person: who.name,
+    personKey: who.key,
+    phone: String(phone || who.phone || ''),
+    amount: Math.round(sum * 100) / 100,
+    // Snapshot so history stays transparent even if later payments arrive.
+    totalProfitAtTime: profit.total,
+    withdrawnTotalBefore: profit.withdrawnTotal,
+    remainingAfter: Math.round((profit.remaining - sum) * 100) / 100,
+    sharesAtTime: profit.people,
+    note: String(note || ''),
+    createdBy: req.user.id,
+    createdAt: dbx.nowIso(),
+  };
+  db.withdrawals.push(record);
+  dbx.save(db);
+  res.status(201).json({ success: true, withdrawal: record, profit: dbx.profitSummary(db) });
 });
 
 // ---------------- admin: users ----------------
@@ -365,15 +430,65 @@ app.get('/api/admin/users', adminRequired, (req, res) => {
   res.json({ success: true, users: list.map(publicUser) });
 });
 
-// Enable/disable access, or set status.
+// Create a user manually (admin). role: 'user' (default) or 'free' (no payment needed).
+app.post('/api/admin/users', adminRequired, (req, res) => {
+  const { name, email, phone, password, role } = req.body || {};
+  const login = String(email || phone || '').trim().toLowerCase();
+  if (!login) return safeError(res, 400, 'Email or phone is required.');
+  if (!password || String(password).length < 4) return safeError(res, 400, 'Password must be at least 4 characters.');
+  const wantRole = String(role || 'user').toLowerCase();
+  if (!['user', 'free'].includes(wantRole)) return safeError(res, 400, "role must be 'user' or 'free'.");
+  const db = dbx.load();
+  if (db.users.some((u) => (u.email && u.email.toLowerCase() === login) || (u.phone && String(u.phone).toLowerCase() === login))) {
+    return safeError(res, 409, 'Account already exists.');
+  }
+  const id = dbx.nextId(db, 'user');
+  const user = {
+    id,
+    name: String(name || login.split('@')[0] || 'User'),
+    email: String(email || '').trim() || null,
+    phone: String(phone || '').trim() || null,
+    passwordHash: hashPassword(password),
+    role: wantRole,
+    status: 'active',
+    accessEnabled: true,
+    currentPackageId: null,
+    currentPackageName: wantRole === 'free' ? 'Free' : null,
+    packageStartDate: null,
+    packageExpireDate: null,
+    createdAt: dbx.nowIso(),
+  };
+  db.users.push(user);
+  dbx.save(db);
+  res.status(201).json({ success: true, user: publicUser(user), access: evaluateAccess(db, user) });
+});
+
+// Remove a user (admin). Also drops their payments/subscriptions references? No:
+// history is preserved; only the account is deleted (payments keep userId).
+app.delete('/api/admin/users/:id', adminRequired, (req, res) => {
+  const db = dbx.load();
+  const idx = db.users.findIndex((u) => u.id === Number(req.params.id));
+  if (idx < 0 || db.users[idx].role === 'admin') return safeError(res, 404, 'User not found.');
+  const [removed] = db.users.splice(idx, 1);
+  dbx.save(db);
+  res.json({ success: true, removed: publicUser(removed) });
+});
+
+// Enable/disable access, or set status/role (role: user <-> free).
 app.patch('/api/admin/users/:id/access', adminRequired, (req, res) => {
   const db = dbx.load();
   const user = db.users.find((u) => u.id === Number(req.params.id));
   if (!user || user.role === 'admin') return safeError(res, 404, 'User not found.');
   if (req.body.accessEnabled !== undefined) user.accessEnabled = !!req.body.accessEnabled;
   if (req.body.status !== undefined) {
-    if (!['active', 'disabled'].includes(req.body.status)) return safeError(res, 400, 'Invalid status.');
+    if (!['active', 'disabled', 'pending'].includes(req.body.status)) return safeError(res, 400, 'Invalid status.');
     user.status = req.body.status;
+  }
+  if (req.body.role !== undefined) {
+    const r = String(req.body.role).toLowerCase();
+    if (!['user', 'free'].includes(r)) return safeError(res, 400, "role must be 'user' or 'free'.");
+    user.role = r;
+    if (r === 'free' && !user.currentPackageName) user.currentPackageName = 'Free';
   }
   dbx.save(db);
   res.json({ success: true, user: publicUser(user), access: evaluateAccess(db, user) });
@@ -452,6 +567,20 @@ app.put('/api/admin/packages/:id', adminRequired, (req, res) => {
   res.json({ success: true, package: pkg });
 });
 
+// Delete a package. Blocked while PENDING payments reference it (history for
+// APPROVED/REJECTED payments is preserved — only the catalog entry is removed).
+app.delete('/api/admin/packages/:id', adminRequired, (req, res) => {
+  const db = dbx.load();
+  const id = Number(req.params.id);
+  const idx = db.packages.findIndex((p) => p.id === id);
+  if (idx < 0) return safeError(res, 404, 'Package not found.');
+  const blocked = db.payments.some((p) => p.packageId === id && p.status === 'PENDING');
+  if (blocked) return safeError(res, 409, 'Cannot delete: pending payments reference this package.');
+  const [removed] = db.packages.splice(idx, 1);
+  dbx.save(db);
+  res.json({ success: true, removed });
+});
+
 // ---------------- admin: payment methods ----------------
 app.get('/api/admin/payment-methods', adminRequired, (req, res) => {
   const db = req.db;
@@ -485,6 +614,17 @@ app.put('/api/admin/payment-methods/:id', adminRequired, (req, res) => {
   m.updatedAt = dbx.nowIso();
   dbx.save(db);
   res.json({ success: true, paymentMethod: m });
+});
+app.delete('/api/admin/payment-methods/:id', adminRequired, (req, res) => {
+  const db = dbx.load();
+  const id = Number(req.params.id);
+  const idx = db.paymentMethods.findIndex((x) => x.id === id);
+  if (idx < 0) return safeError(res, 404, 'Payment method not found.');
+  const blocked = db.payments.some((p) => p.paymentMethodId === id && p.status === 'PENDING');
+  if (blocked) return safeError(res, 409, 'Cannot delete: pending payments reference this method.');
+  const [removed] = db.paymentMethods.splice(idx, 1);
+  dbx.save(db);
+  res.json({ success: true, removed });
 });
 
 // ---------------- admin: payments verify/history ----------------
