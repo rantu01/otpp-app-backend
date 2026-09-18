@@ -1,7 +1,7 @@
 {
   "name": "otpfetch-backend",
   "version": "1.0.0",
-  "description": "Shared backend for User App, Admin App and Admin Website (rantuOTP access/package/payment system)",
+  "description": "Shared backend for User App, Admin App and Admin Website (Rantu_OTP access/package/payment system)",
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",

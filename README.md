@@ -1,4 +1,4 @@
-# Shared Backend — rantuOTP access / package / payment system
+# Shared Backend — Rantu_OTP access / package / payment system
 
 Single backend used by **User App**, **Admin App** and **Admin Website**
 (all three talk to the same REST API + the same `db.json` database file, so a
