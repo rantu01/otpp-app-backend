@@ -151,6 +151,10 @@ async function getModels() {
       reviewedAt: { type: String, default: null },
       reviewedBy: { type: Number, default: null },
       rejectionReason: { type: String, default: null },
+      // True when the backend auto-approved this payment by matching a
+      // received_payments SMS record (no admin involvement). Shown as an
+      // AUTO badge in the admin app; manual approvals stay false.
+      autoVerified: { type: Boolean, default: false },
     },
     { collection: 'payments', versionKey: false, strict: true }
   );

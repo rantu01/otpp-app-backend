@@ -456,12 +456,13 @@ async function createPayment(data) {
  * Atomic PENDING -> APPROVED. Only one concurrent caller wins (MongoDB
  * findOneAndUpdate with a status filter = compare-and-swap).
  */
-async function approvePaymentAtomic(paymentId, reviewerId) {
+async function approvePaymentAtomic(paymentId, reviewerId, opts) {
   const { OtpPayment, OtpUser, OtpPackage, OtpSubscription } = await getModels();
   const reviewedAt = nowIso();
+  const auto = !!(opts && opts.auto);
   const payment = await OtpPayment.findOneAndUpdate(
     { id: Number(paymentId), status: 'PENDING' },
-    { $set: { status: 'APPROVED', reviewedAt, reviewedBy: reviewerId } },
+    { $set: { status: 'APPROVED', reviewedAt, reviewedBy: reviewerId, autoVerified: auto } },
     { returnDocument: 'after' }
   ).lean();
   if (!payment) {
@@ -989,6 +990,90 @@ async function setReceivedStatus(trxId, status, actorId, matchedPaymentId) {
   return serialize(doc);
 }
 
+/* ---------- auto-verify: match customer payments against SMS records ---------- */
+
+/** PENDING customer payments claiming one bKash TrxID (normally 0-1 rows). */
+async function findPendingPaymentsByTxNorm(norm) {
+  const { OtpPayment } = await getModels();
+  const n = normalizeTxid(norm);
+  if (!n) return [];
+  return serialize(await OtpPayment.find({ transactionIdNorm: n, status: 'PENDING' }).sort({ id: 1 }).lean());
+}
+
+function isBkashMethod(payment) {
+  return /bkash/i.test(String((payment && payment.paymentMethodName) || ''));
+}
+
+/**
+ * Atomically claim a pending received-SMS record for a customer payment.
+ * Returns { outcome, payment } with outcome one of:
+ *   not_found | mismatch | already_used | claimed
+ * The claim is a compare-and-swap (pending -> used + matchedPaymentId), so
+ * two racers for the same TrxID cannot both win. Never trusts the client:
+ * the SMS record must exist and the amount must match.
+ */
+async function claimReceivedForPayment(trxNorm, expectedAmount, paymentId) {
+  const { OtpReceivedPayment } = await getModels();
+  const norm = normalizeRecvTrx(trxNorm);
+  if (!norm) return { outcome: 'not_found', payment: null };
+  const rec = await OtpReceivedPayment.findOne({ trxIdNorm: norm }).lean();
+  if (!rec) return { outcome: 'not_found', payment: null };
+  if (expectedAmount !== undefined && expectedAmount !== null && String(expectedAmount).trim() !== '') {
+    const exp = Number(expectedAmount);
+    if (!Number.isFinite(exp) || Math.abs(Number(rec.amount) - exp) >= 0.005) {
+      return { outcome: 'mismatch', payment: serialize(rec) };
+    }
+  }
+  const updated = await OtpReceivedPayment.findOneAndUpdate(
+    { _id: rec._id, status: 'pending' },
+    { $set: { status: 'used', matchedPaymentId: paymentId, verifiedAt: nowIso(), updatedAt: nowIso() } },
+    { returnDocument: 'after' }
+  ).lean();
+  if (!updated) {
+    const cur = await OtpReceivedPayment.findOne({ _id: rec._id }).lean();
+    return { outcome: 'already_used', payment: serialize(cur) };
+  }
+  return { outcome: 'claimed', payment: serialize(updated) };
+}
+
+/**
+ * Try to auto-verify one PENDING payment: claim the matching SMS record and,
+ * on success, approve through the same atomic path as manual approval
+ * (subscription activation included), flagged autoVerified: true.
+ * Anything else (no record yet, amount mismatch, non-bKash method, lost
+ * race) leaves the payment PENDING for manual review — never auto-rejects.
+ */
+async function tryAutoApprove(payment) {
+  try {
+    if (!payment || payment.status !== 'PENDING') return { auto: false, outcome: 'not_pending', payment };
+    if (!isBkashMethod(payment)) return { auto: false, outcome: 'not_bkash', payment };
+    const claim = await claimReceivedForPayment(payment.transactionIdNorm, payment.amount, payment.id);
+    if (claim.outcome !== 'claimed') return { auto: false, outcome: claim.outcome, payment };
+    try {
+      const { payment: approved } = await approvePaymentAtomic(payment.id, null, { auto: true });
+      try {
+        await createNotification({
+          type: 'AUTO_APPROVED',
+          title: 'Payment auto-verified via bKash SMS',
+          message: `${approved.userName} — ${approved.packageName} (TxID ${approved.transactionId}) matched SMS record.`,
+          paymentRequestId: approved.id,
+        });
+      } catch (e) {
+        console.warn('[auto-verify] notification skipped:', e && e.message);
+      }
+      return { auto: true, outcome: 'claimed', payment: approved };
+    } catch (e) {
+      // Approval lost a race (already reviewed) — the claim stands recorded;
+      // an admin resolves it manually.
+      const cur = await findPaymentById(payment.id);
+      return { auto: false, outcome: 'approve_failed', payment: cur || payment };
+    }
+  } catch (e) {
+    console.warn('[auto-verify] attempt failed:', e && e.message);
+    return { auto: false, outcome: 'error', payment };
+  }
+}
+
 /* ---------- misc ---------- */
 
 function activationWindow(user, durationDays, nowMs) {
@@ -1028,6 +1113,7 @@ module.exports = {
   // received bKash payments
   normalizeRecvTrx, validateReceivedPayload, createReceivedPayment,
   findReceivedByTrx, listReceivedPayments, verifyReceivedPayment, setReceivedStatus,
+  findPendingPaymentsByTxNorm, claimReceivedForPayment, tryAutoApprove,
   // misc
   activationWindow,
 };

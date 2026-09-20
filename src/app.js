@@ -395,19 +395,28 @@ app.post('/api/payments', notBlockedRequired, ah(async (req, res) => {
     }
     throw e;
   }
+  // Auto-verify: if the bKash SMS for this TrxID already landed in
+  // received_payments with a matching amount, approve immediately through
+  // the same atomic path as manual approval (flagged autoVerified: true).
+  // Anything else stays PENDING for manual review — never auto-rejected.
+  const auto = await store.tryAutoApprove(payment);
+  payment = auto.payment;
   // Independent writes, concurrently.
   await Promise.all([
     idemKey ? store.saveIdemKey(idemKey, payment.id) : Promise.resolve(),
     // Admin notification (Admin App polls this; push fan-out below).
-    store.createNotification({
+    // tryAutoApprove already logged its own AUTO_APPROVED notification.
+    auto.auto ? Promise.resolve() : store.createNotification({
       type: 'NEW_PAYMENT',
       title: 'New payment received for verification',
       message: `${req.user.name} paid ${pkg.price} for ${pkg.name} via ${method.name} (TxID ${txid})`,
       paymentRequestId: payment.id,
     }),
   ]);
-  await pushToAdmins(`New payment: ${pkg.name} / TxID ${txid}`);
-  res.status(201).json({ success: true, payment });
+  await pushToAdmins(auto.auto
+    ? `Auto-verified payment: ${pkg.name} / TxID ${txid}`
+    : `New payment: ${pkg.name} / TxID ${txid}`);
+  res.status(201).json({ success: true, payment, autoVerified: auto.auto, verifyOutcome: auto.outcome });
 }));
 
 app.get('/api/payments/mine', notBlockedRequired, ah(async (req, res) => {
@@ -797,7 +806,22 @@ app.post('/api/received-payments', recvAuth, ah(async (req, res) => {
   if (duplicate) {
     return res.json({ success: true, duplicate: true, message: 'Transaction already exists', payment: doc });
   }
-  res.status(201).json({ success: true, duplicate: false, payment: doc });
+  // Late-SMS path: the customer may have submitted this TrxID before the SMS
+  // arrived. Try to auto-approve any waiting PENDING payments claiming it.
+  let autoMatched = 0;
+  try {
+    const waiting = await store.findPendingPaymentsByTxNorm(doc.trxIdNorm);
+    for (const w of waiting) {
+      const auto = await store.tryAutoApprove(w);
+      if (auto.auto) {
+        autoMatched += 1;
+        await pushToAdmins(`Auto-verified payment #${auto.payment.id} / TxID ${auto.payment.transactionId}`);
+      }
+    }
+  } catch (e) {
+    console.warn('[api] late-SMS auto-verify skipped:', e && e.message);
+  }
+  res.status(201).json({ success: true, duplicate: false, payment: doc, autoMatched });
 }));
 
 // GET /api/received-payments — admin list (search/filter/pagination).
