@@ -6,7 +6,9 @@
   "scripts": {
     "start": "node src/index.js",
     "seed": "node src/seed.js",
-    "test": "node src/smoke.js"
+    "test": "node src/smoke.js",
+    "keepalive": "node src/keepalive.js",
+    "keepalive:once": "node src/keepalive.js --once"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",

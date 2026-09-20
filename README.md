@@ -13,6 +13,7 @@ cp .env.example .env   # then edit JWT_SECRET + admin credentials
 npm run seed           # creates admin, packages (৳20/7d, ৳35/20d), bKash/Nagad/Rocket, version config
 npm start              # http://localhost:4000
 npm test               # in-process smoke test (register → pay → approve → access)
+npm run keepalive      # keep-alive pinger (see below; needs KEEPALIVE_URL set)
 ```
 
 Default admin: `ADMIN_EMAIL` / `ADMIN_PASSWORD` from `.env` (example: `admin@example.com` / `admin123`).
@@ -24,7 +25,31 @@ backend/
   package.json  .env.example  README.md
   src/
     index.js  app.js  auth.js  db.js  models.js  store.js  mongo.js  seed.js  smoke.js
+    keepalive.js  # Render keep-alive pinger (GET /api/health on a schedule)
 ```
+
+## Keep-alive pinger (Render free tier)
+
+Render sleeps a web service after ~15 minutes without traffic. `src/keepalive.js`
+pings `GET /api/health` on a schedule so the deployed backend stays warm. It is
+a separate process — run it as a Render Background Worker / Cron Job or any
+always-on machine (self-pinging from inside the web service cannot work, since
+a sleeping service also suspends its own timers). It never touches the API or
+database beyond the public health check, and `npm start` behaviour is unchanged.
+
+```bash
+# .env (or Render environment variables):
+KEEPALIVE_URL=https://your-app.onrender.com
+KEEPALIVE_INTERVAL_MINUTES=7   # <-- THE INTERVAL: change 7 -> 10 for 10 minutes
+
+npm run keepalive         # loop: ping now, then every N minutes
+npm run keepalive:once    # single ping and exit (for external cron schedulers,
+                          # e.g. Render Cron Job schedule `*/7 * * * *`)
+```
+
+Interval default is **7 minutes** (`KEEPALIVE_INTERVAL_MINUTES` in `src/keepalive.js`;
+`.env` overrides it when set). The health endpoint is public, tiny, and exempt
+from rate limiting, so pings are cheap.
 
 All application data is stored directly in MongoDB (database `MONGO_DB_NAME`,
 connection `MONGODB_URI` from `.env`) as JSON-compatible documents. There is
