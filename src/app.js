@@ -74,7 +74,24 @@ const normalizeDeviceId = (s) => String(s || '').trim().toLowerCase().replace(/[
 
 // ---------------- public: health + version check ----------------
 app.get('/api/health', (req, res) => {
-  res.json({ success: true, status: 'ok', time: new Date().toISOString(), db: isConnected() ? 'mongo' : 'disconnected', mongoDb: getDbName() });
+  // build.commit lets you confirm WHAT code is actually running in production:
+  // Render sets RENDER_GIT_COMMIT automatically on every deploy. If `commit`
+  // here does not match your latest GitHub commit, Render is still serving
+  // old code (redeploy) — auto-verify fixes only take effect after deploy.
+  res.json({
+    success: true,
+    status: 'ok',
+    time: new Date().toISOString(),
+    db: isConnected() ? 'mongo' : 'disconnected',
+    mongoDb: getDbName(),
+    autoVerify: true,
+    recvpay: true,
+    build: {
+      commit: String(process.env.RENDER_GIT_COMMIT || process.env.GIT_COMMIT || 'local').slice(0, 12),
+      branch: String(process.env.RENDER_GIT_BRANCH || ''),
+      service: String(process.env.RENDER_SERVICE_NAME || ''),
+    },
+  });
 });
 
 // GET /api/versions/check?platform=android&version=1.0.0
@@ -416,7 +433,15 @@ app.post('/api/payments', notBlockedRequired, ah(async (req, res) => {
   await pushToAdmins(auto.auto
     ? `Auto-verified payment: ${pkg.name} / TxID ${txid}`
     : `New payment: ${pkg.name} / TxID ${txid}`);
-  res.status(201).json({ success: true, payment, autoVerified: auto.auto, verifyOutcome: auto.outcome });
+  // verifyNote tells the client/admin WHY auto-verify did (not) approve,
+  // e.g. "SMS amount Tk 90 does not match package Tk 120".
+  res.status(201).json({
+    success: true,
+    payment,
+    autoVerified: auto.auto,
+    verifyOutcome: auto.outcome,
+    verifyNote: auto.note || payment.verifyNote || null,
+  });
 }));
 
 app.get('/api/payments/mine', notBlockedRequired, ah(async (req, res) => {
@@ -803,6 +828,7 @@ app.post('/api/received-payments', recvAuth, ah(async (req, res) => {
     deviceInfo: String(b.deviceInfo || req.headers['user-agent'] || '').slice(0, 500),
     source: String(b.source || 'bkash_sms').slice(0, 50),
   });
+  console.log(`[recvpay] stored trx=${doc.trxIdNorm} amount=${doc.amount} sender=${doc.sender} duplicate=${duplicate}`);
   if (duplicate) {
     return res.json({ success: true, duplicate: true, message: 'Transaction already exists', payment: doc });
   }

@@ -12,19 +12,24 @@
  * The health endpoint is public, tiny, and exempt from rate limiting
  * (see src/security.js), so pings are cheap and never lock accounts.
  *
- * Usage:
- *   npm run keepalive         # loop: ping now, then repeat every N minutes
- *   npm run keepalive:once    # single ping and exit (for external schedulers)
- *   node src/keepalive.js --once
+ * DEPLOYED MODE (recommended): this repo ships `render.yaml`, a Render
+ * Blueprint containing a Cron Job that runs `node src/keepalive.js --once`
+ * every 7 minutes. Apply it once via Render dashboard -> New -> Blueprint.
+ * Each run pings with retries (cold-start tolerant) and exits, so it costs
+ * only seconds of runtime per day instead of a 24/7 worker.
  *
- * +====================================================================+
- * |  CONFIG — TO CHANGE THE INTERVAL, EDIT JUST THIS ONE VALUE:        |
- * |                                                                    |
- * |      KEEPALIVE_INTERVAL_MINUTES = 7   (default: every 7 minutes)    |
- * |                                                                    |
- * |  Example: for every 10 minutes, change 7 -> 10 below (or set       |
- * |  KEEPALIVE_INTERVAL_MINUTES=10 in `.env` — env wins when set).     |
- * +====================================================================+
+ * TO CHANGE THE INTERVAL: edit the `schedule:` line in `render.yaml`
+ * (cron format — star-slash-7 means every 7 min, star-slash-10 every 10).
+ * For loop mode below, set KEEPALIVE_INTERVAL_MINUTES instead.
+ *
+ * LOOP MODE (any always-on machine): npm run keepalive
+ * ONCE MODE (external schedulers):  npm run keepalive:once
+ *
+ * Env knobs (see .env.example):
+ *   KEEPALIVE_URL            Render web-service URL (required)
+ *   KEEPALIVE_INTERVAL_MINUTES  loop-mode interval (default 7)
+ *   KEEPALIVE_RETRIES           attempts per run (default 4, rides out cold starts)
+ *   KEEPALIVE_RETRY_WAIT_MS     wait between attempts (default 20000)
  */
 try { require('dotenv').config(); } catch { /* dotenv optional */ }
 
@@ -43,6 +48,17 @@ const KEEPALIVE_URL = String(
 
 /** Per-ping network timeout in ms. */
 const KEEPALIVE_TIMEOUT_MS = Number(process.env.KEEPALIVE_TIMEOUT_MS || 15000);
+
+/**
+ * Total ping attempts per run. Matters because a sleeping Render service
+ * needs 30-60s to cold-start: the FIRST ping wakes it but usually times
+ * out, and only a retry lands on the warm server. With the defaults
+ * (4 attempts x 20s wait) one `--once` run rides out a full cold start.
+ */
+const KEEPALIVE_RETRIES = Number(process.env.KEEPALIVE_RETRIES || 4);
+
+/** Wait between attempts in ms. */
+const KEEPALIVE_RETRY_WAIT_MS = Number(process.env.KEEPALIVE_RETRY_WAIT_MS || 20000);
 
 const HEALTH_PATH = '/api/health';
 const ONCE = process.argv.includes('--once');
@@ -101,6 +117,26 @@ async function runOnce() {
   return false;
 }
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Ping until success or attempts run out. The first attempt against a
+ * sleeping Render service wakes it (and typically fails); the retries land
+ * once it is warm. Returns true on the first success.
+ */
+async function runWithRetries(tag) {
+  const attempts = Math.max(1, Math.floor(KEEPALIVE_RETRIES) || 1);
+  for (let i = 1; i <= attempts; i++) {
+    const ok = await runOnce();
+    if (ok) return true;
+    if (i < attempts) {
+      console.log(`[keepalive] ${stamp()} attempt ${i}/${attempts} failed (${tag}); retrying in ${Math.round(KEEPALIVE_RETRY_WAIT_MS / 1000)}s…`);
+      await sleep(Math.max(1000, KEEPALIVE_RETRY_WAIT_MS));
+    }
+  }
+  return false;
+}
+
 // ------------------------------ main ------------------------------
 
 async function main() {
@@ -121,7 +157,9 @@ async function main() {
   }
 
   if (ONCE) {
-    const ok = await runOnce();
+    // Single scheduled run (Render Cron Job): retry through a cold start,
+    // then exit — exit code tells the scheduler if it worked.
+    const ok = await runWithRetries('--once');
     process.exit(ok ? 0 : 1);
   }
 
@@ -130,9 +168,9 @@ async function main() {
     `[keepalive] pinging ${KEEPALIVE_URL}${HEALTH_PATH} ` +
     `every ${KEEPALIVE_INTERVAL_MINUTES} minute(s). Press Ctrl+C to stop.`
   );
-  await runOnce(); // ping immediately so the first wait isn't idle
+  await runWithRetries('loop-start'); // ping immediately so the first wait isn't idle
   const timer = setInterval(() => {
-    runOnce().catch((e) => console.error('[keepalive] unexpected error:', e && e.message));
+    runWithRetries('loop').catch((e) => console.error('[keepalive] unexpected error:', e && e.message));
   }, intervalMs);
   // Keep the event loop alive for the interval (no unref — this IS the job).
   void timer;

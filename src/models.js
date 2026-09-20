@@ -155,6 +155,10 @@ async function getModels() {
       // received_payments SMS record (no admin involvement). Shown as an
       // AUTO badge in the admin app; manual approvals stay false.
       autoVerified: { type: Boolean, default: false },
+      // Why the last auto-verify attempt did (not) approve, e.g.
+      // "SMS amount Tk 90 does not match package Tk 120".
+      // Set on PENDING payments only; cleared on manual approve/reject.
+      verifyNote: { type: String, default: null },
     },
     { collection: 'payments', versionKey: false, strict: true }
   );

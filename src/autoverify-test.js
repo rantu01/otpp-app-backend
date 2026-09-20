@@ -6,9 +6,10 @@
  * Covers:
  *  A. submit-first, SMS later  -> late-SMS path auto-approves (autoVerified:true)
  *  B. SMS-first, submit later  -> submit path auto-approves immediately
- *  C. amount mismatch          -> stays PENDING for manual review
+ *  C. amount mismatch          -> stays PENDING + verifyNote explains why
  *  D. double-claim             -> same SMS cannot approve twice (claim is atomic)
  *  E. manual approval still works and stays autoVerified:false
+ *  F. admin-Verified SMS       -> still claimable when the customer submits late
  */
 try { require('dotenv').config(); } catch { /* optional */ }
 const http = require('http');
@@ -115,17 +116,20 @@ async function main() {
       && subB.json.autoVerified === true && subB.json.payment.autoVerified === true,
       JSON.stringify(subB.json).slice(0, 160));
 
-    // C. amount mismatch -> stays PENDING for manual review.
+    // C. amount mismatch -> stays PENDING + reason persisted and returned.
     const tidC = `AUTOC${uniq}`;
     const subC = await call(port, 'POST', '/api/payments',
       { packageId: pkg.id, paymentMethodId: bkash.id, transactionId: tidC }, userTok);
     const smsC = await call(port, 'POST', '/api/received-payments', sms(tidC, pkg.price + 50), adminTok);
     const listC = await call(port, 'GET', `/api/admin/payments?search=${tidC}`, null, adminTok);
     const payC = (listC.json.payments || [])[0];
-    check('C mismatch stays PENDING',
+    check('C mismatch stays PENDING with reason',
       subC.json.payment.status === 'PENDING' && smsC.json.autoMatched === 0
-      && payC && payC.status === 'PENDING' && payC.autoVerified !== true,
-      `autoMatched=${smsC.json.autoMatched} status=${payC && payC.status}`);
+      && payC && payC.status === 'PENDING' && payC.autoVerified !== true
+      // Submit-time note (no SMS yet) differs from the post-SMS mismatch note.
+      && /No bKash SMS record/.test(subC.json.verifyNote || '')
+      && /does not match/.test(payC.verifyNote || ''),
+      `autoMatched=${smsC.json.autoMatched} status=${payC && payC.status} note=${payC && payC.verifyNote}`);
 
     // D. double-claim: re-POST the same SMS -> duplicate, no second approval.
     const dupA = await call(port, 'POST', '/api/received-payments', sms(tidA, pkg.price), adminTok);
@@ -139,6 +143,33 @@ async function main() {
       manual.status === 200 && manual.json.payment.status === 'APPROVED'
       && manual.json.payment.autoVerified !== true,
       JSON.stringify((manual.json.payment || {})).slice(0, 120));
+
+    // F. SMS flipped to `verified` by manual Verify BEFORE the customer
+    // submits must still be claimable (Verify confirms funds; it must not
+    // burn the record).
+    const tidF = `AUTOF${uniq}`;
+    const smsF = await call(port, 'POST', '/api/received-payments', sms(tidF, pkg.price), adminTok);
+    check('F SMS stored pending', smsF.status === 201 && smsF.json.autoMatched === 0);
+    const verF = await call(port, 'POST', '/api/received-payments/verify', { trxId: tidF }, adminTok);
+    check('F manual Verify flips to verified',
+      verF.status === 200 && verF.json.payment && verF.json.payment.status === 'verified',
+      JSON.stringify((verF.json.payment || {})).slice(0, 120));
+    const subF = await call(port, 'POST', '/api/payments',
+      { packageId: pkg.id, paymentMethodId: bkash.id, transactionId: tidF }, userTok);
+    check('F submit after manual Verify still auto-approves',
+      subF.status === 201 && subF.json.payment.status === 'APPROVED' && subF.json.autoVerified === true,
+      JSON.stringify(subF.json).slice(0, 160));
+    const gotF = await call(port, 'GET', `/api/received-payments/${tidF}`, null, adminTok);
+    check('F SMS record used + linked',
+      gotF.json.payment && gotF.json.payment.status === 'used'
+      && gotF.json.payment.matchedPaymentId === subF.json.payment.id);
+
+    // G. health exposes the deployed commit so prod staleness is checkable.
+    const health = await call(port, 'GET', '/api/health', null, null);
+    check('G health reports autoVerify + build',
+      health.json.autoVerify === true && health.json.recvpay === true
+      && health.json.build && typeof health.json.build.commit === 'string',
+      JSON.stringify(health.json.build || {}));
   } finally {
     server.close();
   }

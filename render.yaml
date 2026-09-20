@@ -1,0 +1,75 @@
+# Render Blueprint — keeps the OTP backend web service awake.
+#
+# WHAT THIS IS:
+#   Render's free tier sleeps a web service after ~15 min without traffic.
+#   This file adds a Cron Job that runs `node src/keepalive.js --once`
+#   on a schedule. Each run pings GET /api/health (with retries that ride
+#   out a cold start) and exits, so it costs seconds of runtime per day —
+#   far cheaper than a 24/7 Background Worker.
+#
+# HOW TO APPLY (one time):
+#   1. Commit + push this file to GitHub.
+#   2. Render dashboard -> New -> Blueprint -> select this repo.
+#      (Your existing manually-created web service stays as-is; this only
+#      ADDS the cron job. Alternatively, let the Blueprint manage both —
+#      see the commented web-service block at the bottom.)
+#   3. In the dashboard, set the cron job's KEEPALIVE_URL to your web
+#      service URL, e.g. https://otp-backend-xxxx.onrender.com
+#   4. Check the cron job's Logs: you should see "[keepalive] ... OK"
+#      every run. If the web service was asleep, the first attempt FAILs
+#      (it just woke the server) and a retry logs OK — that is normal.
+#
+# +==================================================================+
+# |  TO CHANGE THE INTERVAL, EDIT ONLY THE `schedule:` LINE BELOW.   |
+# |  Cron format (minute hour day month weekday):                     |
+# |    every 7 minutes:   "*/7 * * * *"   (default)                   |
+# |    every 10 minutes:  "*/10 * * * *"                              |
+# |    every 5 minutes:   "*/5 * * * *"                               |
+# |    every 15 minutes:  "*/15 * * * *"                              |
+# +==================================================================+
+services:
+  - type: cron
+    name: otp-keepalive
+    runtime: node
+    buildCommand: npm install
+    startCommand: node src/keepalive.js --once
+    schedule: "*/7 * * * *"
+    envVars:
+      # Set this in the Render dashboard (marked sync:false so Blueprint
+      # syncs never overwrite your value).
+      - key: KEEPALIVE_URL
+        sync: false
+      # Attempts per run — 4 x 20s covers a full Render cold start.
+      - key: KEEPALIVE_RETRIES
+        value: 4
+      - key: KEEPALIVE_RETRY_WAIT_MS
+        value: 20000
+
+# --------------------------------------------------------------------
+# OPTIONAL: let this Blueprint own the web service too (instead of the
+# manually created one). Uncomment to manage everything as code.
+# --------------------------------------------------------------------
+# services:
+#   - type: web
+#     name: otp-backend
+#     runtime: node
+#     buildCommand: npm install
+#     startCommand: npm start
+#     healthCheckPath: /api/health
+#     envVars:
+#       - key: NODE_VERSION
+#         value: 18.20.5
+#       - key: MONGODB_URI
+#         sync: false
+#       - key: MONGO_DB_NAME
+#         value: otpdb
+#       - key: JWT_SECRET
+#         sync: false
+#       - key: ADMIN_EMAIL
+#         sync: false
+#       - key: ADMIN_PASSWORD
+#         sync: false
+#       - key: RECV_API_KEY
+#         sync: false
+#       # RENDER_GIT_COMMIT / RENDER_GIT_BRANCH / RENDER_SERVICE_NAME are
+#       # provided automatically by Render (used by /api/health build info).

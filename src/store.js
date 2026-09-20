@@ -462,7 +462,17 @@ async function approvePaymentAtomic(paymentId, reviewerId, opts) {
   const auto = !!(opts && opts.auto);
   const payment = await OtpPayment.findOneAndUpdate(
     { id: Number(paymentId), status: 'PENDING' },
-    { $set: { status: 'APPROVED', reviewedAt, reviewedBy: reviewerId, autoVerified: auto } },
+    {
+      $set: {
+        status: 'APPROVED',
+        reviewedAt,
+        reviewedBy: reviewerId,
+        autoVerified: auto,
+        // Manual review supersedes any earlier auto-verify note; an
+        // auto-approval records its own positive note below.
+        verifyNote: null,
+      },
+    },
     { returnDocument: 'after' }
   ).lean();
   if (!payment) {
@@ -520,7 +530,19 @@ async function approvePaymentAtomic(paymentId, reviewerId, opts) {
     createdBy: reviewerId,
     deviceId: userDoc.deviceIdNorm || userDoc.deviceId || null,
   });
-  return { payment: serialize(payment), subscription: serialize(sub.toObject()), user: publicUser(updatedUser) };
+  // Auto-approvals stamp a positive note (manual approvals cleared any
+  // stale auto-verify note in the $set above, so they stay null).
+  let outPayment = serialize(payment);
+  if (auto) {
+    try {
+      const note = `Auto-approved: bKash SMS Tk ${payment.amount} matched TrxID ${payment.transactionId}.`;
+      await OtpPayment.updateOne({ id: payment.id }, { $set: { verifyNote: note } });
+      outPayment.verifyNote = note;
+    } catch (e) {
+      console.warn('[approve] auto note skipped:', e && e.message);
+    }
+  }
+  return { payment: outPayment, subscription: serialize(sub.toObject()), user: publicUser(updatedUser) };
 }
 
 async function rejectPaymentAtomic(paymentId, reviewerId, reason) {
@@ -533,6 +555,8 @@ async function rejectPaymentAtomic(paymentId, reviewerId, reason) {
         reviewedAt: nowIso(),
         reviewedBy: reviewerId,
         rejectionReason: String(reason || 'Transaction ID could not be verified.'),
+        // A human decision supersedes any earlier auto-verify note.
+        verifyNote: null,
       },
     },
     { returnDocument: 'after' }
@@ -1005,12 +1029,15 @@ function isBkashMethod(payment) {
 }
 
 /**
- * Atomically claim a pending received-SMS record for a customer payment.
+ * Atomically claim a received-SMS record for a customer payment.
  * Returns { outcome, payment } with outcome one of:
  *   not_found | mismatch | already_used | claimed
- * The claim is a compare-and-swap (pending -> used + matchedPaymentId), so
- * two racers for the same TrxID cannot both win. Never trusts the client:
- * the SMS record must exist and the amount must match.
+ * Claimable states are `pending` AND `verified`: an admin may have pressed
+ * Verify on the SMS before the customer submitted it (manual Verify only
+ * confirms the funds — it must not burn the record). The claim itself is a
+ * compare-and-swap (-> used + matchedPaymentId), so two racers for the same
+ * TrxID cannot both win. Never trusts the client: the SMS record must exist
+ * and the amount must match.
  */
 async function claimReceivedForPayment(trxNorm, expectedAmount, paymentId) {
   const { OtpReceivedPayment } = await getModels();
@@ -1025,7 +1052,7 @@ async function claimReceivedForPayment(trxNorm, expectedAmount, paymentId) {
     }
   }
   const updated = await OtpReceivedPayment.findOneAndUpdate(
-    { _id: rec._id, status: 'pending' },
+    { _id: rec._id, status: { $in: ['pending', 'verified'] } },
     { $set: { status: 'used', matchedPaymentId: paymentId, verifiedAt: nowIso(), updatedAt: nowIso() } },
     { returnDocument: 'after' }
   ).lean();
@@ -1037,6 +1064,24 @@ async function claimReceivedForPayment(trxNorm, expectedAmount, paymentId) {
 }
 
 /**
+ * Persist the auto-verify reason on a still-PENDING payment so admins (and
+ * API clients) can see WHY it was (not) auto-approved. The PENDING filter
+ * guarantees a later manual approve/reject is never clobbered.
+ */
+async function stampVerifyNote(paymentId, note) {
+  if (!note) return;
+  try {
+    const { OtpPayment } = await getModels();
+    await OtpPayment.updateOne(
+      { id: Number(paymentId), status: 'PENDING' },
+      { $set: { verifyNote: String(note).slice(0, 500) } }
+    );
+  } catch (e) {
+    console.warn('[auto-verify] note skipped:', e && e.message);
+  }
+}
+
+/**
  * Try to auto-verify one PENDING payment: claim the matching SMS record and,
  * on success, approve through the same atomic path as manual approval
  * (subscription activation included), flagged autoVerified: true.
@@ -1044,13 +1089,34 @@ async function claimReceivedForPayment(trxNorm, expectedAmount, paymentId) {
  * race) leaves the payment PENDING for manual review — never auto-rejects.
  */
 async function tryAutoApprove(payment) {
+  const tid = payment && (payment.transactionIdNorm || payment.transactionId);
+  const log = (outcome, extra) =>
+    console.log(`[auto-verify] tid=${tid} payment=#${payment && payment.id} outcome=${outcome}${extra ? ' ' + extra : ''}`);
   try {
-    if (!payment || payment.status !== 'PENDING') return { auto: false, outcome: 'not_pending', payment };
-    if (!isBkashMethod(payment)) return { auto: false, outcome: 'not_bkash', payment };
+    if (!payment || payment.status !== 'PENDING') return { auto: false, outcome: 'not_pending', payment, note: null };
+    if (!isBkashMethod(payment)) return { auto: false, outcome: 'not_bkash', payment, note: null };
     const claim = await claimReceivedForPayment(payment.transactionIdNorm, payment.amount, payment.id);
-    if (claim.outcome !== 'claimed') return { auto: false, outcome: claim.outcome, payment };
+    if (claim.outcome !== 'claimed') {
+      let note = null;
+      if (claim.outcome === 'not_found') {
+        note = 'No bKash SMS record for this TrxID yet — waiting for the payment phone to upload it.';
+      } else if (claim.outcome === 'mismatch') {
+        const found = claim.payment ? claim.payment.amount : '?';
+        note = `SMS amount Tk ${found} does not match package Tk ${payment.amount} — needs manual review.`;
+      } else if (claim.outcome === 'already_used') {
+        const mid = claim.payment && claim.payment.matchedPaymentId;
+        note = mid ? `This TrxID was already used by payment #${mid}.` : 'This TrxID was already used by another payment.';
+      }
+      log(claim.outcome);
+      if (note) {
+        await stampVerifyNote(payment.id, note);
+        payment = { ...payment, verifyNote: note };
+      }
+      return { auto: false, outcome: claim.outcome, payment, note };
+    }
     try {
       const { payment: approved } = await approvePaymentAtomic(payment.id, null, { auto: true });
+      log('claimed', 'APPROVED');
       try {
         await createNotification({
           type: 'AUTO_APPROVED',
@@ -1061,16 +1127,19 @@ async function tryAutoApprove(payment) {
       } catch (e) {
         console.warn('[auto-verify] notification skipped:', e && e.message);
       }
-      return { auto: true, outcome: 'claimed', payment: approved };
+      return { auto: true, outcome: 'claimed', payment: approved, note: approved.verifyNote || null };
     } catch (e) {
       // Approval lost a race (already reviewed) — the claim stands recorded;
       // an admin resolves it manually.
+      const note = 'SMS matched but the approval was already processed — needs manual review.';
+      log('approve_failed');
+      await stampVerifyNote(payment.id, note);
       const cur = await findPaymentById(payment.id);
-      return { auto: false, outcome: 'approve_failed', payment: cur || payment };
+      return { auto: false, outcome: 'approve_failed', payment: cur || payment, note };
     }
   } catch (e) {
     console.warn('[auto-verify] attempt failed:', e && e.message);
-    return { auto: false, outcome: 'error', payment };
+    return { auto: false, outcome: 'error', payment, note: null };
   }
 }
 
