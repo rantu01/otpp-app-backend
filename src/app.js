@@ -196,23 +196,34 @@ app.post('/api/auth/device', ah(async (req, res) => {
   }
   let user = await store.findUserByDeviceNorm(norm);
   if (!user) {
-    user = await store.createUser({
-      name: 'Device ' + norm.slice(0, 8),
-      email: null,
-      phone: null,
-      // Unhashable random secret: this account can never log in by password.
-      passwordHash: hashPassword('dev-locked-' + norm + '-' + Date.now() + '-' + Math.random()),
-      role: 'user',
-      status: 'pending',
-      accessEnabled: true,
-      deviceId: norm,
-      deviceIdNorm: norm,
-      currentPackageId: null,
-      currentPackageName: null,
-      packageStartDate: null,
-      packageExpireDate: null,
-      createdAt: store.nowIso(),
-    });
+    try {
+      user = await store.createUser({
+        name: 'Device ' + norm.slice(0, 8),
+        email: null,
+        phone: null,
+        // Unhashable random secret: this account can never log in by password.
+        passwordHash: hashPassword('dev-locked-' + norm + '-' + Date.now() + '-' + Math.random()),
+        role: 'user',
+        status: 'pending',
+        accessEnabled: true,
+        deviceId: norm,
+        deviceIdNorm: norm,
+        currentPackageId: null,
+        currentPackageName: null,
+        packageStartDate: null,
+        packageExpireDate: null,
+        createdAt: store.nowIso(),
+      });
+    } catch (e) {
+      // Lost a create race (same device activated twice at once): re-read
+      // the winner instead of surfacing HTTP 500 "Internal server error".
+      if (e && e.code === 'DUPLICATE_LOGIN') {
+        user = await store.findUserByDeviceNorm(norm);
+        if (!user) throw e;
+      } else {
+        throw e;
+      }
+    }
   }
   const access = evaluateAccess(null, user);
   // Server-side kill-switch: a disabled/blocked device must NOT receive a
@@ -242,24 +253,41 @@ app.post('/api/auth/activate', ah(async (req, res) => {
     }
     return res.json({ success: true, registered: true, token: signToken(user), user: publicUser(user), access });
   }
-  const created = await store.createUser({
-    name: 'Device ' + deviceId.slice(0, 8),
-    email: null,
-    phone: null,
-    // Random unguessable secret: device accounts authenticate via their
-    // device ID (this endpoint) and can never log in with a password.
-    passwordHash: hashPassword(crypto.randomBytes(32).toString('hex')),
-    role: 'user',
-    status: 'pending',
-    accessEnabled: true,
-    deviceId,
-    deviceIdNorm: store.deviceKey(deviceId),
-    currentPackageId: null,
-    currentPackageName: null,
-    packageStartDate: null,
-    packageExpireDate: null,
-    createdAt: store.nowIso(),
-  });
+  let created;
+  try {
+    created = await store.createUser({
+      name: 'Device ' + deviceId.slice(0, 8),
+      email: null,
+      phone: null,
+      // Random unguessable secret: device accounts authenticate via their
+      // device ID (this endpoint) and can never log in with a password.
+      passwordHash: hashPassword(crypto.randomBytes(32).toString('hex')),
+      role: 'user',
+      status: 'pending',
+      accessEnabled: true,
+      deviceId,
+      deviceIdNorm: store.deviceKey(deviceId),
+      currentPackageId: null,
+      currentPackageName: null,
+      packageStartDate: null,
+      packageExpireDate: null,
+      createdAt: store.nowIso(),
+    });
+  } catch (e) {
+    // Lost a create race: re-read the winner instead of HTTP 500.
+    if (e && e.code === 'DUPLICATE_LOGIN') {
+      const winner = await store.findUserByDevice(deviceId);
+      if (winner) {
+        if (winner.role === 'admin') return safeError(res, 403, 'Admins cannot activate the User App.');
+        const access = evaluateAccess(null, winner);
+        if (!access.allowed && access.reason !== 'NO_PACKAGE' && access.reason !== 'PENDING') {
+          return safeError(res, 403, access.message, { code: access.reason, access });
+        }
+        return res.json({ success: true, registered: true, token: signToken(winner), user: publicUser(winner), access });
+      }
+    }
+    throw e;
+  }
   res.status(201).json({ success: true, registered: false, token: signToken(created), user: publicUser(created), access: evaluateAccess(null, created) });
 }));
 

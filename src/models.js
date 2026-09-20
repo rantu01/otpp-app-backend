@@ -80,7 +80,12 @@ async function getModels() {
     },
     { collection: 'users', versionKey: false, strict: true }
   );
-  userSchema.index({ email: 1 }, { sparse: true, unique: true });
+  // Email uniqueness applies ONLY to real string emails. Device accounts
+  // (email null/missing) must never collide — the old sparse+unique index
+  // treated null as a value and blocked every 2nd device activation with
+  // E11000 -> HTTP 500 "Internal server error" on POST /api/auth/device
+  // (admin login was unaffected, which is why only the User App broke).
+  userSchema.index({ email: 1 }, { unique: true, partialFilterExpression: { email: { $type: 'string' } } });
   // Login $or branch: { email } | { phone } — each branch needs its own index.
   userSchema.index({ phone: 1 }, { sparse: true });
   // Admin user list: { role: $in:[user,free] } + sort { id: -1 }.
@@ -259,6 +264,21 @@ async function getModels() {
     OtpWithdrawal: mongoose.model('OtpWithdrawal', withdrawalSchema),
     OtpIdemKey: mongoose.model('OtpIdemKey', idemSchema),
   };
+
+  // Migrate the legacy sparse+unique email index (blocked multiple null
+  // emails) to the partial-unique index defined above. syncIndexes() alone
+  // may keep the old index when name/key match, so drop the stale shape
+  // explicitly before syncing.
+  try {
+    const list = await cached.OtpUser.collection.listIndexes().toArray();
+    const emailIdx = (list || []).find((i) => i && i.name === 'email_1');
+    if (emailIdx && (emailIdx.sparse || !emailIdx.partialFilterExpression)) {
+      await cached.OtpUser.collection.dropIndex('email_1').catch(() => null);
+      console.log('[mongo] dropped legacy sparse email index (email_1).');
+    }
+  } catch (e) {
+    console.warn('[mongo] email index check skipped:', e && e.message);
+  }
 
   // Ensure indexes exist (safe to call repeatedly).
   await Promise.all(Object.values(cached).map((m) => m.syncIndexes().catch(() => null)));
