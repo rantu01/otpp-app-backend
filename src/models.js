@@ -149,14 +149,16 @@ async function getModels() {
       status: { type: String, enum: ['PENDING', 'APPROVED', 'REJECTED', 'CANCELLED'], default: 'PENDING' },
       submittedAt: { type: String, default: isoNow },
       reviewedAt: { type: String, default: null },
-      reviewedBy: { type: Number, default: null },
+      // Manual review stores the numeric admin id; automatic approval
+      // stores the string "AUTO". Mixed type keeps both readable.
+      reviewedBy: { type: Schema.Types.Mixed, default: null },
       rejectionReason: { type: String, default: null },
       // True when the backend auto-approved this payment by matching a
       // received_payments SMS record (no admin involvement). Shown as an
       // AUTO badge in the admin app; manual approvals stay false.
       autoVerified: { type: Boolean, default: false },
       // Why the last auto-verify attempt did (not) approve, e.g.
-      // "SMS amount Tk 90 does not match package Tk 120".
+      // "No bKash SMS record for this TrxID yet".
       // Set on PENDING payments only; cleared on manual approve/reject.
       verifyNote: { type: String, default: null },
     },
@@ -194,7 +196,9 @@ async function getModels() {
         default: 'pending',
       },
       matchedPaymentId: { type: Number, default: null },
-      verifiedBy: { type: Number, default: null },
+      // Manual verify stores the numeric admin id; automatic approval
+      // stores the string "AUTO".
+      verifiedBy: { type: Schema.Types.Mixed, default: null },
       verifiedAt: { type: String, default: null },
       createdAt: { type: String, default: isoNow },
       updatedAt: { type: String, default: isoNow },

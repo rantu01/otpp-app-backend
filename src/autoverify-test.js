@@ -96,40 +96,56 @@ async function main() {
     check('A late SMS auto-matches', smsA.status === 201 && smsA.json.autoMatched === 1,
       JSON.stringify(smsA.json).slice(0, 120));
     const gotA = await call(port, 'GET', `/api/received-payments/${tidA}`, null, adminTok);
-    check('A SMS record used + linked',
-      gotA.json.payment && gotA.json.payment.status === 'used'
-      && gotA.json.payment.matchedPaymentId === subA.json.payment.id,
-      JSON.stringify((gotA.json.payment || {})).slice(0, 160));
+    check('A SMS record verified + linked + AUTO',
+      gotA.json.payment && gotA.json.payment.status === 'verified'
+      && gotA.json.payment.matchedPaymentId === subA.json.payment.id
+      && gotA.json.payment.verifiedBy === 'AUTO'
+      && typeof gotA.json.payment.verifiedAt === 'string',
+      JSON.stringify((gotA.json.payment || {})).slice(0, 200));
     const listA = await call(port, 'GET', `/api/admin/payments?search=${tidA}`, null, adminTok);
     const payA = (listA.json.payments || [])[0];
-    check('A payment APPROVED + autoVerified',
-      payA && payA.status === 'APPROVED' && payA.autoVerified === true,
-      JSON.stringify(payA || {}).slice(0, 160));
+    check('A payment APPROVED + autoVerified + reviewedBy AUTO',
+      payA && payA.status === 'APPROVED' && payA.autoVerified === true
+      && payA.reviewedBy === 'AUTO' && typeof payA.reviewedAt === 'string',
+      JSON.stringify(payA || {}).slice(0, 200));
+    check('A submit response shape',
+      subA.json.status === 'PENDING' && /waiting for verification/.test(subA.json.message || '')
+      && smsA.json && typeof smsA.json.autoMatched === 'number');
 
     // B. SMS first, then submit -> immediate auto-approval on submit.
+    // Response shape matches the required contract.
     const tidB = `AUTOB${uniq}`;
     await call(port, 'POST', '/api/received-payments', sms(tidB, pkg.price), adminTok);
     const subB = await call(port, 'POST', '/api/payments',
       { packageId: pkg.id, paymentMethodId: bkash.id, transactionId: tidB }, userTok);
     check('B submit auto-approves (SMS already there)',
       subB.status === 201 && subB.json.payment.status === 'APPROVED'
-      && subB.json.autoVerified === true && subB.json.payment.autoVerified === true,
-      JSON.stringify(subB.json).slice(0, 160));
+      && subB.json.autoVerified === true && subB.json.payment.autoVerified === true
+      && subB.json.status === 'APPROVED' && subB.json.message === 'Payment verified automatically.'
+      && subB.json.payment.reviewedBy === 'AUTO',
+      JSON.stringify(subB.json).slice(0, 220));
 
-    // C. amount mismatch -> stays PENDING + reason persisted and returned.
+    // C. THE RULE: TrxID match is sufficient — SMS Tk 90 approves a Tk 120
+    // package request (amounts deliberately different, as required).
+    const pkg120 = (pkgs.json.packages || []).find((p) => Number(p.price) === 120) || pkg;
     const tidC = `AUTOC${uniq}`;
     const subC = await call(port, 'POST', '/api/payments',
-      { packageId: pkg.id, paymentMethodId: bkash.id, transactionId: tidC }, userTok);
-    const smsC = await call(port, 'POST', '/api/received-payments', sms(tidC, pkg.price + 50), adminTok);
+      { packageId: pkg120.id, paymentMethodId: bkash.id, transactionId: tidC }, userTok);
+    check('C submit PENDING before SMS',
+      subC.json.payment.status === 'PENDING' && subC.json.status === 'PENDING'
+      && subC.json.message === 'Payment submitted and is waiting for verification.');
+    const smsC = await call(port, 'POST', '/api/received-payments', sms(tidC, 90), adminTok);
     const listC = await call(port, 'GET', `/api/admin/payments?search=${tidC}`, null, adminTok);
     const payC = (listC.json.payments || [])[0];
-    check('C mismatch stays PENDING with reason',
-      subC.json.payment.status === 'PENDING' && smsC.json.autoMatched === 0
-      && payC && payC.status === 'PENDING' && payC.autoVerified !== true
-      // Submit-time note (no SMS yet) differs from the post-SMS mismatch note.
-      && /No bKash SMS record/.test(subC.json.verifyNote || '')
-      && /does not match/.test(payC.verifyNote || ''),
-      `autoMatched=${smsC.json.autoMatched} status=${payC && payC.status} note=${payC && payC.verifyNote}`);
+    const gotC = await call(port, 'GET', `/api/received-payments/${tidC}`, null, adminTok);
+    check('C TrxID match auto-approves despite 90 vs 120',
+      smsC.json.autoMatched === 1
+      && payC && payC.status === 'APPROVED' && payC.autoVerified === true
+      && payC.reviewedBy === 'AUTO'
+      && gotC.json.payment && gotC.json.payment.status === 'verified'
+      && gotC.json.payment.matchedPaymentId === payC.id
+      && gotC.json.payment.verifiedBy === 'AUTO',
+      `autoMatched=${smsC.json.autoMatched} status=${payC && payC.status} recv=${gotC.json.payment && gotC.json.payment.status}`);
 
     // D. double-claim: re-POST the same SMS -> duplicate, no second approval.
     const dupA = await call(port, 'POST', '/api/received-payments', sms(tidA, pkg.price), adminTok);
@@ -137,12 +153,25 @@ async function main() {
       dupA.json.duplicate === true && (dupA.json.autoMatched === undefined || dupA.json.autoMatched === 0),
       JSON.stringify(dupA.json).slice(0, 120));
 
-    // E. manual approval still works and is NOT flagged auto.
-    const manual = await call(port, 'POST', `/api/admin/payments/${subC.json.payment.id}/approve`, {}, adminTok);
-    check('E manual approve works, autoVerified=false',
-      manual.status === 200 && manual.json.payment.status === 'APPROVED'
-      && manual.json.payment.autoVerified !== true,
-      JSON.stringify((manual.json.payment || {})).slice(0, 120));
+    // D2. same TrxID submitted twice by a customer -> 409, no duplicate payment.
+    const dupSub = await call(port, 'POST', '/api/payments',
+      { packageId: pkg.id, paymentMethodId: bkash.id, transactionId: tidB }, userTok);
+    check('D2 resubmitted TrxID rejected',
+      dupSub.status === 409 && /already been submitted/.test(dupSub.json.error || ''),
+      `status=${dupSub.status}`);
+
+    // E. manual approval still works and is NOT flagged auto (fresh PENDING).
+    const tidE = `AUTOE${uniq}`;
+    const subE = await call(port, 'POST', '/api/payments',
+      { packageId: pkg.id, paymentMethodId: bkash.id, transactionId: tidE }, userTok);
+    const manual = await call(port, 'POST', `/api/admin/payments/${subE.json.payment.id}/approve`, {}, adminTok);
+    check('E manual approve works, autoVerified=false, numeric reviewer',
+      subE.json.payment.status === 'PENDING'
+      && manual.status === 200 && manual.json.payment.status === 'APPROVED'
+      && manual.json.payment.autoVerified !== true
+      && typeof manual.json.payment.reviewedBy === 'number'
+      && (manual.json.payment.verifyNote === null || manual.json.payment.verifyNote === undefined),
+      JSON.stringify((manual.json.payment || {})).slice(0, 160));
 
     // F. SMS flipped to `verified` by manual Verify BEFORE the customer
     // submits must still be claimable (Verify confirms funds; it must not
@@ -160,9 +189,11 @@ async function main() {
       subF.status === 201 && subF.json.payment.status === 'APPROVED' && subF.json.autoVerified === true,
       JSON.stringify(subF.json).slice(0, 160));
     const gotF = await call(port, 'GET', `/api/received-payments/${tidF}`, null, adminTok);
-    check('F SMS record used + linked',
-      gotF.json.payment && gotF.json.payment.status === 'used'
-      && gotF.json.payment.matchedPaymentId === subF.json.payment.id);
+    check('F SMS record verified + linked + AUTO',
+      gotF.json.payment && gotF.json.payment.status === 'verified'
+      && gotF.json.payment.matchedPaymentId === subF.json.payment.id
+      && gotF.json.payment.verifiedBy === 'AUTO'
+      && subF.json.payment.reviewedBy === 'AUTO');
 
     // G. health exposes the deployed commit so prod staleness is checkable.
     const health = await call(port, 'GET', '/api/health', null, null);

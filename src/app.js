@@ -412,10 +412,13 @@ app.post('/api/payments', notBlockedRequired, ah(async (req, res) => {
     }
     throw e;
   }
-  // Auto-verify: if the bKash SMS for this TrxID already landed in
-  // received_payments with a matching amount, approve immediately through
-  // the same atomic path as manual approval (flagged autoVerified: true).
+  // Automatic approval rule: TrxID match is sufficient.
+  //   received_payments.trxIdNorm === payments.transactionIdNorm
+  // If a matching SMS record exists, approve immediately through the same
+  // atomic path as manual approval (flagged autoVerified + reviewedBy AUTO).
   // Anything else stays PENDING for manual review — never auto-rejected.
+  console.log(`[PAYMENT AUTO VERIFY] Submit Payment received (payment #${payment.id})`);
+  console.log(`[PAYMENT AUTO VERIFY] Transaction ID: ${norm}`);
   const auto = await store.tryAutoApprove(payment);
   payment = auto.payment;
   // Independent writes, concurrently.
@@ -433,12 +436,16 @@ app.post('/api/payments', notBlockedRequired, ah(async (req, res) => {
   await pushToAdmins(auto.auto
     ? `Auto-verified payment: ${pkg.name} / TxID ${txid}`
     : `New payment: ${pkg.name} / TxID ${txid}`);
-  // verifyNote tells the client/admin WHY auto-verify did (not) approve,
-  // e.g. "SMS amount Tk 90 does not match package Tk 120".
+  // The response tells the customer whether auto-verification fired.
+  // verifyNote explains WHY when it did not (e.g. no SMS record yet).
   res.status(201).json({
     success: true,
     payment,
     autoVerified: auto.auto,
+    status: payment.status,
+    message: auto.auto
+      ? 'Payment verified automatically.'
+      : 'Payment submitted and is waiting for verification.',
     verifyOutcome: auto.outcome,
     verifyNote: auto.note || payment.verifyNote || null,
   });
@@ -828,7 +835,7 @@ app.post('/api/received-payments', recvAuth, ah(async (req, res) => {
     deviceInfo: String(b.deviceInfo || req.headers['user-agent'] || '').slice(0, 500),
     source: String(b.source || 'bkash_sms').slice(0, 50),
   });
-  console.log(`[recvpay] stored trx=${doc.trxIdNorm} amount=${doc.amount} sender=${doc.sender} duplicate=${duplicate}`);
+  console.log(`[PAYMENT AUTO VERIFY] SMS stored: trx=${doc.trxIdNorm} amount=${doc.amount} sender=${doc.sender} duplicate=${duplicate}`);
   if (duplicate) {
     return res.json({ success: true, duplicate: true, message: 'Transaction already exists', payment: doc });
   }
