@@ -46,8 +46,9 @@ async function backfillDeviceNorms(models) {
 
 async function getModels() {
   const mongoose = await ensureMongo();
-  if (cached) return cached;
-  if (mongoose.models.OtpUser && mongoose.models.OtpCounter) {
+  if (cached && cached.OtpReceivedPayment) return cached;
+  cached = null;
+  if (mongoose.models.OtpUser && mongoose.models.OtpCounter && mongoose.models.OtpReceivedPayment) {
     cached = mongoose.models;
     return cached;
   }
@@ -164,6 +165,41 @@ async function getModels() {
   paymentSchema.index({ packageId: 1, status: 1 });
   paymentSchema.index({ paymentMethodId: 1, status: 1 });
 
+  const receivedPaymentSchema = new Schema(
+    {
+      id: { type: Number, required: true, unique: true },
+      amount: { type: Number, required: true, min: 0 },
+      sender: { type: String, required: true },
+      fee: { type: Number, default: 0 },
+      balance: { type: Number, default: null },
+      trxId: { type: String, required: true },
+      trxIdNorm: { type: String, required: true },
+      transactionDate: { type: String, default: null },
+      transactionTime: { type: String, default: null },
+      originalMessage: { type: String, default: '' },
+      receivedAt: { type: String, default: isoNow },
+      deviceInfo: { type: String, default: '' },
+      source: { type: String, default: 'bkash_sms' },
+      status: {
+        type: String,
+        enum: ['pending', 'verified', 'used', 'rejected', 'duplicate'],
+        default: 'pending',
+      },
+      matchedPaymentId: { type: Number, default: null },
+      verifiedBy: { type: Number, default: null },
+      verifiedAt: { type: String, default: null },
+      createdAt: { type: String, default: isoNow },
+      updatedAt: { type: String, default: isoNow },
+    },
+    { collection: 'received_payments', versionKey: false, strict: true }
+  );
+  // Duplicate protection: one document per bKash TrxID (final authority).
+  receivedPaymentSchema.index({ trxIdNorm: 1 }, { unique: true });
+  receivedPaymentSchema.index({ transactionDate: 1 });
+  receivedPaymentSchema.index({ sender: 1 });
+  receivedPaymentSchema.index({ createdAt: 1 });
+  receivedPaymentSchema.index({ status: 1, id: -1 });
+
   const subscriptionSchema = new Schema(
     {
       id: { type: Number, required: true, unique: true },
@@ -263,6 +299,7 @@ async function getModels() {
     OtpFcmToken: mongoose.model('OtpFcmToken', fcmSchema),
     OtpWithdrawal: mongoose.model('OtpWithdrawal', withdrawalSchema),
     OtpIdemKey: mongoose.model('OtpIdemKey', idemSchema),
+    OtpReceivedPayment: mongoose.models.OtpReceivedPayment || mongoose.model('OtpReceivedPayment', receivedPaymentSchema),
   };
 
   // Migrate the legacy sparse+unique email index (blocked multiple null

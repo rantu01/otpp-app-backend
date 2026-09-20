@@ -67,6 +67,7 @@ app.use('/api/payments', requireMongo);
 app.use('/api/subscriptions', requireMongo);
 app.use('/api/admin', requireMongo);
 app.use('/api/protected', requireMongo);
+app.use('/api/received-payments', requireMongo);
 
 /** Device IDs: case-insensitive, punctuation-insensitive. */
 const normalizeDeviceId = (s) => String(s || '').trim().toLowerCase().replace(/[^a-z0-9]/g, '');
@@ -746,6 +747,100 @@ app.put('/api/admin/versions/:platform', adminRequired, ah(async (req, res) => {
   if (req.body.updateRequired !== undefined) patch.updateRequired = !!req.body.updateRequired;
   const v = await store.upsertVersion(String(req.params.platform || 'android'), patch);
   res.json({ success: true, version: v });
+}));
+
+// ---------------- received bKash SMS payments (Recive payment app) ----------------
+/**
+ * Auth for the payment-receiver phone: EITHER a valid admin JWT
+ * OR the shared RECV_API_KEY (header x-api-key). The phone never sees
+ * MongoDB credentials — it only calls this API. Server validates everything.
+ */
+function recvAuth(req, res, next) {
+  const key = String(process.env.RECV_API_KEY || '').trim();
+  const sent = String(req.headers['x-api-key'] || '').trim();
+  if (key && sent && sent === key) return next();
+  return authRequired(req, res, () => {
+    if (req.user && req.user.role === 'admin') return next();
+    // Allow the receiver phone to use a normal user token too? No — least
+    // privilege: API key or admin. Anything else is rejected.
+    return safeError(res, 403, 'Receiver authentication required (x-api-key or admin login).');
+  });
+}
+
+// POST /api/received-payments — called automatically by the Recive payment app.
+app.post('/api/received-payments', recvAuth, ah(async (req, res) => {
+  const b = req.body || {};
+  const v = store.validateReceivedPayload(b);
+  if (v.errs.length) return safeError(res, 400, v.errs[0], { errors: v.errs });
+  const fee = b.fee !== undefined && b.fee !== null && String(b.fee).trim() !== '' ? Number(b.fee) : 0;
+  const balance = b.balance !== undefined && b.balance !== null && String(b.balance).trim() !== '' ? Number(b.balance) : null;
+  if (!Number.isFinite(fee) || fee < 0) return safeError(res, 400, 'fee must be a non-negative number.');
+  if (balance !== null && (!Number.isFinite(balance) || balance < 0)) return safeError(res, 400, 'balance must be a non-negative number.');
+  let txnDate = b.transactionDate ? String(b.transactionDate).trim() : null;
+  if (txnDate && /^\d{2}\/\d{2}\/\d{4}$/.test(txnDate)) {
+    const [dd, mm, yyyy] = txnDate.split('/');
+    txnDate = `${yyyy}-${mm}-${dd}`;
+  }
+  const { doc, duplicate } = await store.createReceivedPayment({
+    amount: v.amount,
+    sender: v.sender || String(b.sender || '').trim(),
+    fee,
+    balance,
+    trxId: v.trxId,
+    transactionDate: txnDate,
+    transactionTime: b.transactionTime ? String(b.transactionTime).trim().slice(0, 8) : null,
+    originalMessage: String(b.originalMessage || '').slice(0, 2000),
+    receivedAt: b.receivedAt ? String(b.receivedAt).slice(0, 40) : store.nowIso(),
+    deviceInfo: String(b.deviceInfo || req.headers['user-agent'] || '').slice(0, 500),
+    source: String(b.source || 'bkash_sms').slice(0, 50),
+  });
+  if (duplicate) {
+    return res.json({ success: true, duplicate: true, message: 'Transaction already exists', payment: doc });
+  }
+  res.status(201).json({ success: true, duplicate: false, payment: doc });
+}));
+
+// GET /api/received-payments — admin list (search/filter/pagination).
+app.get('/api/received-payments', adminRequired, ah(async (req, res) => {
+  const paged = await store.listReceivedPayments({
+    status: req.query.status, search: req.query.search,
+    date: req.query.date, sender: req.query.sender,
+    page: req.query.page, limit: req.query.limit,
+  });
+  res.json({ success: true, payments: paged.payments, total: paged.total, page: paged.page, limit: paged.limit, hasMore: paged.hasMore });
+}));
+
+// GET /api/received-payments/:trxId — lookup one TrxID (admin).
+app.get('/api/received-payments/:trxId', adminRequired, ah(async (req, res) => {
+  const doc = await store.findReceivedByTrx(req.params.trxId);
+  if (!doc) return safeError(res, 404, 'Transaction not found.');
+  res.json({ success: true, payment: doc });
+}));
+
+// POST /api/received-payments/verify — match a customer-submitted TrxID.
+app.post('/api/received-payments/verify', adminRequired, ah(async (req, res) => {
+  const { trxId, transactionId, amount, expectedAmount } = req.body || {};
+  const tid = trxId || transactionId;
+  if (!tid) return safeError(res, 400, 'trxId is required.');
+  const exp = amount !== undefined ? amount : expectedAmount;
+  const result = await store.verifyReceivedPayment(tid, exp, req.user.id);
+  if (!result.found) return res.status(404).json({ success: false, error: 'No received payment with this TrxID.', found: false });
+  if (!result.amountOk) {
+    return res.json({ success: true, found: true, amountOk: false, message: 'Amount mismatch.', payment: result.payment });
+  }
+  res.json({ success: true, found: true, amountOk: true, payment: result.payment });
+}));
+
+// PATCH /api/received-payments/:trxId/status — admin status transitions.
+app.patch('/api/received-payments/:trxId/status', adminRequired, ah(async (req, res) => {
+  try {
+    const doc = await store.setReceivedStatus(req.params.trxId, req.body.status, req.user.id, req.body.matchedPaymentId);
+    if (!doc) return safeError(res, 404, 'Transaction not found.');
+    res.json({ success: true, payment: doc });
+  } catch (e) {
+    if (e && e.code === 'BAD_STATUS') return safeError(res, 400, e.message);
+    throw e;
+  }
 }));
 
 // ---------------- helpers ----------------

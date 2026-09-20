@@ -835,6 +835,160 @@ async function saveIdemKey(key, paymentId) {
   );
 }
 
+/* ---------- received bKash SMS payments (Recive payment app) ---------- */
+
+function normalizeRecvTrx(s) {
+  return String(s || '').trim().toUpperCase().replace(/[\s-]+/g, '');
+}
+
+function validateReceivedPayload(b) {
+  const errs = [];
+  const amount = Number(b && b.amount);
+  if (!Number.isFinite(amount) || amount <= 0) errs.push('amount must be a positive number.');
+  const trxId = String((b && (b.trxId || b.transactionId)) || '').trim();
+  if (!/^[A-Z0-9]{6,20}$/i.test(trxId)) errs.push('trxId must be 6-20 alphanumeric characters.');
+  const sender = String((b && b.sender) || '').trim();
+  if (sender && !/^[0-9+]{6,16}$/.test(sender.replace(/[\s-]/g, ''))) errs.push('sender must be a phone number.');
+  if (b && b.transactionDate !== undefined && b.transactionDate !== null && String(b.transactionDate).trim() !== '') {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(String(b.transactionDate).trim()) && !/^\d{2}\/\d{2}\/\d{4}$/.test(String(b.transactionDate).trim())) {
+      errs.push('transactionDate must be YYYY-MM-DD or DD/MM/YYYY.');
+    }
+  }
+  return { errs, amount, trxId, sender };
+}
+
+async function createReceivedPayment(data) {
+  const { OtpReceivedPayment } = await getModels();
+  const norm = normalizeRecvTrx(data.trxId);
+  const existing = await OtpReceivedPayment.findOne({ trxIdNorm: norm }).lean();
+  if (existing) {
+    return { doc: serialize(existing), duplicate: true };
+  }
+  const id = await nextId('receivedPayment');
+  try {
+    const doc = await OtpReceivedPayment.create({
+      id,
+      amount: data.amount,
+      sender: data.sender || '',
+      fee: data.fee !== undefined && data.fee !== null ? Number(data.fee) : 0,
+      balance: data.balance !== undefined && data.balance !== null && data.balance !== '' ? Number(data.balance) : null,
+      trxId: String(data.trxId).trim().toUpperCase(),
+      trxIdNorm: norm,
+      transactionDate: data.transactionDate || null,
+      transactionTime: data.transactionTime || null,
+      originalMessage: String(data.originalMessage || '').slice(0, 2000),
+      receivedAt: data.receivedAt || nowIso(),
+      deviceInfo: String(data.deviceInfo || '').slice(0, 500),
+      source: String(data.source || 'bkash_sms').slice(0, 50),
+      status: 'pending',
+      matchedPaymentId: null,
+      verifiedBy: null,
+      verifiedAt: null,
+      createdAt: nowIso(),
+      updatedAt: nowIso(),
+    });
+    return { doc: serialize(doc.toObject()), duplicate: false };
+  } catch (e) {
+    if (e && e.code === 11000) {
+      const winner = await OtpReceivedPayment.findOne({ trxIdNorm: norm }).lean();
+      return { doc: serialize(winner), duplicate: true };
+    }
+    throw e;
+  }
+}
+
+async function findReceivedByTrx(trxId) {
+  const { OtpReceivedPayment } = await getModels();
+  const norm = normalizeRecvTrx(trxId);
+  if (!norm) return null;
+  return serialize(await OtpReceivedPayment.findOne({ trxIdNorm: norm }).lean());
+}
+
+function receivedFilter({ status, search, date, sender } = {}) {
+  const filter = {};
+  if (status) filter.status = String(status).toLowerCase();
+  if (date) filter.transactionDate = String(date).trim();
+  if (sender) filter.sender = { $regex: escapeRegex(String(sender).trim()), $options: 'i' };
+  if (search) {
+    const q = String(search).trim();
+    if (q) {
+      filter.$or = [
+        { trxId: { $regex: escapeRegex(q), $options: 'i' } },
+        { trxIdNorm: { $regex: escapeRegex(q.toUpperCase()), $options: 'i' } },
+        { sender: { $regex: escapeRegex(q), $options: 'i' } },
+      ];
+    }
+  }
+  return filter;
+}
+
+async function listReceivedPayments(opts = {}) {
+  const { OtpReceivedPayment } = await getModels();
+  const pg = pageParams(opts);
+  const filter = receivedFilter(opts);
+  const [docs, total] = await Promise.all([
+    OtpReceivedPayment.find(filter).sort({ id: -1 }).skip(pg.skip).limit(pg.limit).lean(),
+    fastCount(OtpReceivedPayment, filter),
+  ]);
+  return { payments: serialize(docs), total, page: pg.page, limit: pg.limit, hasMore: pg.skip + docs.length < total };
+}
+
+/**
+ * Verify a customer-submitted TrxID against the received_payments collection.
+ * Never trusts the client: the SMS record must exist, and the amount must
+ * match (within tolerance) when an expected amount is supplied.
+ */
+async function verifyReceivedPayment(trxId, expectedAmount, actorId) {
+  const { OtpReceivedPayment } = await getModels();
+  const norm = normalizeRecvTrx(trxId);
+  if (!norm) {
+    const err = new Error('trxId is required.');
+    err.code = 'BAD_TRX';
+    throw err;
+  }
+  const rec = await OtpReceivedPayment.findOne({ trxIdNorm: norm }).lean();
+  if (!rec) {
+    return { found: false, payment: null };
+  }
+  let amountOk = true;
+  if (expectedAmount !== undefined && expectedAmount !== null && String(expectedAmount).trim() !== '') {
+    const exp = Number(expectedAmount);
+    amountOk = Number.isFinite(exp) && Math.abs(Number(rec.amount) - exp) < 0.005;
+  }
+  if (amountOk && rec.status === 'pending') {
+    const updated = await OtpReceivedPayment.findOneAndUpdate(
+      { _id: rec._id, status: 'pending' },
+      { $set: { status: 'verified', verifiedBy: actorId || null, verifiedAt: nowIso(), updatedAt: nowIso() } },
+      { returnDocument: 'after' }
+    ).lean();
+    return { found: true, amountOk, payment: serialize(updated || rec) };
+  }
+  return { found: true, amountOk, payment: serialize(rec) };
+}
+
+async function setReceivedStatus(trxId, status, actorId, matchedPaymentId) {
+  const { OtpReceivedPayment } = await getModels();
+  const allowed = ['pending', 'verified', 'used', 'rejected'];
+  const want = String(status || '').toLowerCase();
+  if (!allowed.includes(want)) {
+    const err = new Error('status must be one of: ' + allowed.join(', '));
+    err.code = 'BAD_STATUS';
+    throw err;
+  }
+  const patch = { status: want, updatedAt: nowIso() };
+  if (want === 'verified' || want === 'used') {
+    patch.verifiedBy = actorId || null;
+    patch.verifiedAt = nowIso();
+  }
+  if (matchedPaymentId !== undefined && matchedPaymentId !== null && String(matchedPaymentId).trim() !== '') {
+    patch.matchedPaymentId = Number(matchedPaymentId);
+  }
+  const doc = await OtpReceivedPayment.findOneAndUpdate(
+    { trxIdNorm: normalizeRecvTrx(trxId) }, { $set: patch }, { returnDocument: 'after' }
+  ).lean();
+  return serialize(doc);
+}
+
 /* ---------- misc ---------- */
 
 function activationWindow(user, durationDays, nowMs) {
@@ -871,6 +1025,9 @@ module.exports = {
   listWithdrawals, createWithdrawal, dashboardStats,
   // idempotency
   findPaymentIdByIdemKey, saveIdemKey,
+  // received bKash payments
+  normalizeRecvTrx, validateReceivedPayload, createReceivedPayment,
+  findReceivedByTrx, listReceivedPayments, verifyReceivedPayment, setReceivedStatus,
   // misc
   activationWindow,
 };
