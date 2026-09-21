@@ -85,15 +85,10 @@ function singleSessionBlock(user, incomingNorm) {
   const stored = normalizeDeviceId(user.activeDeviceId || user.deviceIdNorm || user.deviceId || '');
   const incoming = normalizeDeviceId(incomingNorm || '');
   if (!user.activeSessionId) return null;
-  if (stored && incoming && stored !== incoming) {
-    return { code: 'SESSION_IN_USE', message: SESSION_IN_USE_MSG };
-  }
-  // No device identity supplied while another device holds the session:
-  // fail closed rather than silently sharing the account.
-  if (stored && !incoming) {
-    return { code: 'SESSION_IN_USE', message: SESSION_IN_USE_MSG };
-  }
-  return null;
+  // Same device re-login is always allowed (session rotates to the new token).
+  if (stored && incoming && stored === incoming) return null;
+  // Any other case with an active session: block (fail closed).
+  return { code: 'SESSION_IN_USE', message: SESSION_IN_USE_MSG };
 }
 
 // ---------------- public: health + version check ----------------
@@ -259,12 +254,9 @@ app.post('/api/auth/login', ah(async (req, res) => {
     });
     return res.json({ success: true, token: signToken(updated, sid), user: publicUser(updated), access: evaluateAccess(null, updated) });
   }
-  // Admin logins also get a single live session (same-device re-login rotates).
+  // Admin logins: no single-device restriction — admins may log in
+  // from any device (same-session rotation still applies).
   {
-    const block = singleSessionBlock(user, reqDevice);
-    if (block) {
-      return safeError(res, 409, block.message, { code: block.code });
-    }
     const sid = crypto.randomUUID();
     const updated = await store.updateUserById(user.id, {
       activeSessionId: sid,
