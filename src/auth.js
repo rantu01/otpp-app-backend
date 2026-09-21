@@ -26,8 +26,12 @@ function verifyPassword(pw, hash) {
     return false;
   }
 }
-function signToken(user) {
-  return jwt.sign({ sub: user.id, role: user.role }, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN });
+function signToken(user, sessionId) {
+  const payload = { sub: user.id, role: user.role };
+  // sid binds the JWT to one login session so simultaneous logins on two
+  // devices cannot both stay live (see single-session check below).
+  if (sessionId) payload.sid = String(sessionId);
+  return jwt.sign(payload, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN });
 }
 function publicUser(u) {
   return store.publicUser(u);
@@ -41,6 +45,17 @@ async function authRequired(req, res, next) {
     const payload = jwt.verify(token, JWT_SECRET);
     const user = await store.findUserById(Number(payload.sub));
     if (!user) return res.status(401).json({ success: false, error: 'Account not found' });
+    // Single-session enforcement: if this account logged in again from the
+    // same device (session rotated) or was logged out, an older token no
+    // longer matches the live session and must stop working. Legacy tokens
+    // issued before sessions existed carry no sid and are grandfathered.
+    if (user.activeSessionId && payload.sid && user.activeSessionId !== String(payload.sid)) {
+      return res.status(401).json({
+        success: false,
+        error: 'This account is currently logged in on another device. Please log out from that device first, then log in here.',
+        code: 'SESSION_IN_USE',
+      });
+    }
     req.auth = payload;
     req.user = user;
     next();

@@ -49,9 +49,11 @@ async function ensureAdmin(models) {
   if (admin.role !== 'admin') patch.role = 'admin';
   if (admin.status !== 'active') patch.status = 'active';
   if (admin.accessEnabled !== true) patch.accessEnabled = true;
-  if (!verifyPassword(password, admin.passwordHash)) patch.passwordHash = hashPassword(password);
-  if (Object.keys(patch).length) {
-    await models.OtpUser.updateOne({ _id: admin._id }, { $set: patch });
+   if (!verifyPassword(password, admin.passwordHash)) patch.passwordHash = hashPassword(password);
+   patch.activeSessionId = null;
+   patch.activeDeviceId = null;
+   if (Object.keys(patch).length) {
+     await models.OtpUser.updateOne({ _id: admin._id }, { $set: patch });
   }
   console.log('[seed] admin synced from .env:', email);
 }
@@ -141,12 +143,14 @@ async function ensureSampleUsers(models) {
       });
       console.log('[seed] sample user:', w.email, `(${w.role}/${w.status})`);
     } else {
-      // Keep seed deterministic without destroying admin edits to packages:
-      // only sync identity fields + password.
+   // Keep seed deterministic without destroying admin edits to packages:
+      // only sync identity fields + password + clear any stale session.
       const patch = {};
       if (existing.name !== w.name) patch.name = w.name;
       if (existing.role !== w.role) patch.role = w.role;
       if (!verifyPassword(w.password, existing.passwordHash)) patch.passwordHash = hashPassword(w.password);
+      patch.activeSessionId = null;
+      patch.activeDeviceId = null;
       if (Object.keys(patch).length) {
         await models.OtpUser.updateOne({ _id: existing._id }, { $set: patch });
         console.log('[seed] sample user synced:', w.email);

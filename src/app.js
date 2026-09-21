@@ -72,6 +72,30 @@ app.use('/api/received-payments', requireMongo);
 /** Device IDs: case-insensitive, punctuation-insensitive. */
 const normalizeDeviceId = (s) => String(s || '').trim().toLowerCase().replace(/[^a-z0-9]/g, '');
 
+/** Canonical "another device" message shared by login + session enforcement. */
+const SESSION_IN_USE_MSG = 'This account is currently logged in on another device. Please log out from that device first, then log in here.';
+
+/**
+ * Single active session per account (most important rule).
+ * Returns null when the incoming device may proceed, or an error descriptor
+ * when a DIFFERENT device still holds the live session.
+ * Same-device re-login is always allowed (session rotates to the new token).
+ */
+function singleSessionBlock(user, incomingNorm) {
+  const stored = normalizeDeviceId(user.activeDeviceId || user.deviceIdNorm || user.deviceId || '');
+  const incoming = normalizeDeviceId(incomingNorm || '');
+  if (!user.activeSessionId) return null;
+  if (stored && incoming && stored !== incoming) {
+    return { code: 'SESSION_IN_USE', message: SESSION_IN_USE_MSG };
+  }
+  // No device identity supplied while another device holds the session:
+  // fail closed rather than silently sharing the account.
+  if (stored && !incoming) {
+    return { code: 'SESSION_IN_USE', message: SESSION_IN_USE_MSG };
+  }
+  return null;
+}
+
 // ---------------- public: health + version check ----------------
 app.get('/api/health', (req, res) => {
   // build.commit lets you confirm WHAT code is actually running in production:
@@ -152,7 +176,16 @@ app.post('/api/auth/register', ah(async (req, res) => {
     }
     throw e;
   }
-  res.status(201).json({ success: true, token: signToken(user), user: publicUser(user), access: evaluateAccess(null, user) });
+  // New account logs straight into its first (and only) session.
+  const sid = crypto.randomUUID();
+  const devNorm = normalizeDeviceId(req.body && req.body.deviceId);
+  user = await store.updateUserById(user.id, {
+    activeSessionId: sid,
+    activeDeviceId: devNorm || null,
+    ...(devNorm ? { deviceId: devNorm, deviceIdNorm: store.deviceKey(devNorm) } : {}),
+    lastLoginAt: store.nowIso(),
+  });
+  res.status(201).json({ success: true, token: signToken(user, sid), user: publicUser(user), access: evaluateAccess(null, user) });
 }));
 
 app.post('/api/auth/login', ah(async (req, res) => {
@@ -183,16 +216,63 @@ app.post('/api/auth/login', ah(async (req, res) => {
   // successfully log in from (password already verified above).
   const reqDevice = normalizeDeviceId(req.body.deviceId);
   if (user.role !== 'admin') {
+    // One device per account: a live session on another device blocks this
+    // login until that device logs out (which clears the session server-side
+    // and lets the new device adopt the account below).
+    const block = singleSessionBlock(user, reqDevice);
+    if (block) {
+      return safeError(res, 409, block.message, { code: block.code });
+    }
+    if (user.deviceId && reqDevice && normalizeDeviceId(user.deviceId) !== reqDevice && !user.activeSessionId) {
+      // Logged out earlier on another device: adopt the new device.
+      const sid = crypto.randomUUID();
+      const updated = await store.updateUserById(user.id, {
+        deviceId: reqDevice,
+        deviceIdNorm: store.deviceKey(reqDevice),
+        activeSessionId: sid,
+        activeDeviceId: reqDevice,
+        lastLoginAt: store.nowIso(),
+      });
+      return res.json({ success: true, token: signToken(updated, sid), user: publicUser(updated), access: evaluateAccess(null, updated) });
+    }
     if (user.deviceId && reqDevice && normalizeDeviceId(user.deviceId) !== reqDevice) {
       const denied = { allowed: false, reason: 'DEVICE_MISMATCH', message: 'This account is activated on a different device. Contact admin.' };
       return safeError(res, 403, denied.message, { code: denied.reason, access: denied });
     }
     if (!user.deviceId && reqDevice) {
-      const updated = await store.updateUserById(user.id, { deviceId: reqDevice, deviceIdNorm: store.deviceKey(reqDevice) });
-      return res.json({ success: true, token: signToken(updated), user: publicUser(updated), access: evaluateAccess(null, updated) });
+      const sid = crypto.randomUUID();
+      const updated = await store.updateUserById(user.id, {
+        deviceId: reqDevice,
+        deviceIdNorm: store.deviceKey(reqDevice),
+        activeSessionId: sid,
+        activeDeviceId: reqDevice,
+        lastLoginAt: store.nowIso(),
+      });
+      return res.json({ success: true, token: signToken(updated, sid), user: publicUser(updated), access: evaluateAccess(null, updated) });
     }
+    // No device identity change: (re)bind the live session to this login.
+    const sid = crypto.randomUUID();
+    const updated = await store.updateUserById(user.id, {
+      activeSessionId: sid,
+      activeDeviceId: reqDevice || normalizeDeviceId(user.deviceId || user.deviceIdNorm || '') || null,
+      lastLoginAt: store.nowIso(),
+    });
+    return res.json({ success: true, token: signToken(updated, sid), user: publicUser(updated), access: evaluateAccess(null, updated) });
   }
-  res.json({ success: true, token: signToken(user), user: publicUser(user), access });
+  // Admin logins also get a single live session (same-device re-login rotates).
+  {
+    const block = singleSessionBlock(user, reqDevice);
+    if (block) {
+      return safeError(res, 409, block.message, { code: block.code });
+    }
+    const sid = crypto.randomUUID();
+    const updated = await store.updateUserById(user.id, {
+      activeSessionId: sid,
+      activeDeviceId: reqDevice || normalizeDeviceId(user.deviceId || user.deviceIdNorm || '') || null,
+      lastLoginAt: store.nowIso(),
+    });
+    return res.json({ success: true, token: signToken(updated, sid), user: publicUser(updated), access: evaluateAccess(null, updated) });
+  }
 }));
 
 app.get('/api/auth/me', notBlockedRequired, (req, res) => {
@@ -201,6 +281,63 @@ app.get('/api/auth/me', notBlockedRequired, (req, res) => {
   if (!req.user) return safeError(res, 401, 'Account not found.', { code: 'NO_ACCOUNT' });
   res.json({ success: true, user: publicUser(req.user), access: evaluateAccess(null, req.user) });
 });
+
+// Logout: clears the live session so the SAME account can log in from another
+// device afterwards. Without this, single-session blocking would be permanent.
+app.post('/api/auth/logout', ah(async (req, res) => {
+  const h = req.headers.authorization || '';
+  const token = h.startsWith('Bearer ') ? h.slice(7) : null;
+  if (!token) return res.json({ success: true, loggedOut: false });
+  let payload = null;
+  try {
+    payload = require('jsonwebtoken').verify(token, process.env.JWT_SECRET || 'change-me-to-a-long-random-secret');
+  } catch {
+    return res.json({ success: true, loggedOut: false });
+  }
+  const user = await store.findUserById(Number(payload.sub));
+  if (!user) return res.json({ success: true, loggedOut: false });
+  // Only the holder of the live session (or a legacy token) may clear it;
+  // a stale rotated-out token must not log out the current device.
+  if (!user.activeSessionId || !payload.sid || user.activeSessionId === String(payload.sid)) {
+    await store.updateUserById(user.id, { activeSessionId: null, activeDeviceId: null });
+  }
+  res.json({ success: true, loggedOut: true });
+}));
+
+// Change password: username (email/phone login) is NEVER editable here or
+// anywhere else — only the password hash changes. Requires the current
+// password so a stolen token alone is not enough.
+app.post('/api/auth/change-password', ah(async (req, res) => {
+  const h = req.headers.authorization || '';
+  const token = h.startsWith('Bearer ') ? h.slice(7) : null;
+  if (!token) return safeError(res, 401, 'Not authenticated');
+  let payload = null;
+  try {
+    payload = require('jsonwebtoken').verify(token, process.env.JWT_SECRET || 'change-me-to-a-long-random-secret');
+  } catch {
+    return safeError(res, 401, 'Session expired. Please login again.');
+  }
+  const user = await store.findUserRawById(Number(payload.sub));
+  if (!user) return safeError(res, 401, 'Account not found.', { code: 'NO_ACCOUNT' });
+  const { currentPassword, newPassword } = req.body || {};
+  if (!newPassword || String(newPassword).length < 4) {
+    return safeError(res, 400, 'New password must be at least 4 characters.');
+  }
+  const lean = user.toObject ? user.toObject() : user;
+  if (!verifyPassword(currentPassword, lean.passwordHash)) {
+    return safeError(res, 400, 'Current password is incorrect.', { code: 'BAD_CURRENT_PASSWORD' });
+  }
+  // Explicit allow-list: passwordHash only. Email/phone/login/username can
+  // never be changed through this endpoint (or any user-facing endpoint).
+  const forbidden = ['email', 'phone', 'login', 'username', 'name', 'role', 'status'];
+  for (const k of forbidden) {
+    if (req.body && req.body[k] !== undefined && k !== 'name') {
+      return safeError(res, 400, 'Username cannot be changed.', { code: 'USERNAME_IMMUTABLE' });
+    }
+  }
+  await store.updateUserPassword(Number(payload.sub), hashPassword(newPassword));
+  res.json({ success: true, message: 'Password changed successfully.' });
+}));
 
 // Device activation (User App first-run flow, no password).
 // POST /api/auth/device { deviceId } -> finds the device account or creates a
@@ -250,7 +387,12 @@ app.post('/api/auth/device', ah(async (req, res) => {
   if (!access.allowed && access.reason !== 'NO_PACKAGE' && access.reason !== 'PENDING') {
     return safeError(res, 403, access.message, { code: access.reason, access });
   }
-  res.json({ success: true, token: signToken(user), user: publicUser(user), access });
+  // Bind the single live session to this device login (same-device rotation).
+  const devSid = crypto.randomUUID();
+  user = await store.updateUserById(user.id, {
+    activeSessionId: devSid, activeDeviceId: norm, lastLoginAt: store.nowIso(),
+  });
+  res.json({ success: true, token: signToken(user, devSid), user: publicUser(user), access });
 }));
 
 // ---------------- device activation (User App first-run screen) ----------------
@@ -269,7 +411,11 @@ app.post('/api/auth/activate', ah(async (req, res) => {
     if (!access.allowed && access.reason !== 'NO_PACKAGE' && access.reason !== 'PENDING') {
       return safeError(res, 403, access.message, { code: access.reason, access });
     }
-    return res.json({ success: true, registered: true, token: signToken(user), user: publicUser(user), access });
+    const actSid = crypto.randomUUID();
+    const bound = await store.updateUserById(user.id, {
+      activeSessionId: actSid, activeDeviceId: deviceId, lastLoginAt: store.nowIso(),
+    });
+    return res.json({ success: true, registered: true, token: signToken(bound, actSid), user: publicUser(bound), access });
   }
   let created;
   try {
@@ -301,12 +447,20 @@ app.post('/api/auth/activate', ah(async (req, res) => {
         if (!access.allowed && access.reason !== 'NO_PACKAGE' && access.reason !== 'PENDING') {
           return safeError(res, 403, access.message, { code: access.reason, access });
         }
-        return res.json({ success: true, registered: true, token: signToken(winner), user: publicUser(winner), access });
+        const wSid = crypto.randomUUID();
+        const bound = await store.updateUserById(winner.id, {
+          activeSessionId: wSid, activeDeviceId: deviceId, lastLoginAt: store.nowIso(),
+        });
+        return res.json({ success: true, registered: true, token: signToken(bound, wSid), user: publicUser(bound), access });
       }
     }
     throw e;
   }
-  res.status(201).json({ success: true, registered: false, token: signToken(created), user: publicUser(created), access: evaluateAccess(null, created) });
+  const createdSid = crypto.randomUUID();
+  created = await store.updateUserById(created.id, {
+    activeSessionId: createdSid, activeDeviceId: deviceId, lastLoginAt: store.nowIso(),
+  });
+  res.status(201).json({ success: true, registered: false, token: signToken(created, createdSid), user: publicUser(created), access: evaluateAccess(null, created) });
 }));
 
 // Public activation lookup: lets the app show "pending admin approval" state
@@ -573,9 +727,16 @@ app.delete('/api/admin/users/:id', adminRequired, ah(async (req, res) => {
 }));
 
 // Enable/disable access, or set status/role (role: user <-> free).
+// Username (email/phone login) is immutable: any attempt to change it here
+// is rejected so usernames always stay unique and never editable.
 app.patch('/api/admin/users/:id/access', adminRequired, ah(async (req, res) => {
   const user = await store.findUserById(Number(req.params.id));
   if (!user || user.role === 'admin') return safeError(res, 404, 'User not found.');
+  for (const k of ['email', 'phone', 'login', 'username']) {
+    if (req.body && req.body[k] !== undefined) {
+      return safeError(res, 400, 'Username cannot be changed.', { code: 'USERNAME_IMMUTABLE' });
+    }
+  }
   const patch = {};
   if (req.body.accessEnabled !== undefined) patch.accessEnabled = !!req.body.accessEnabled;
   if (req.body.status !== undefined) {
@@ -598,7 +759,9 @@ app.patch('/api/admin/users/:id/device', adminRequired, ah(async (req, res) => {
   if (!user || user.role === 'admin') return safeError(res, 404, 'User not found.');
   const raw = req.body.deviceId;
   if (raw === null || raw === undefined || String(raw).trim() === '') {
-    const updated = await store.updateUserById(user.id, { deviceId: null, deviceIdNorm: null });
+    // Clearing the device also clears the live session so the account can
+    // log in fresh from another device (single-session support).
+    const updated = await store.updateUserById(user.id, { deviceId: null, deviceIdNorm: null, activeSessionId: null, activeDeviceId: null });
     return res.json({ success: true, user: publicUser(updated), access: evaluateAccess(null, updated) });
   }
   const d = normalizeDeviceId(raw);
@@ -722,8 +885,22 @@ app.get('/api/admin/payments/pending-count', adminRequired, ah(async (req, res) 
 }));
 
 // APPROVE — atomic: only PENDING can transition; second racer gets 409.
+// Backend amount verification: when a received_payments SMS record exists
+// for this TrxID, its amount must equal the claimed package price, otherwise
+// approval is refused (pass { force: true } as admin to override manually).
 app.post('/api/admin/payments/:id/approve', adminRequired, ah(async (req, res) => {
   try {
+    const existing = await store.findPaymentById(Number(req.params.id));
+    if (existing && existing.status === 'PENDING') {
+      const recv = await store.findReceivedByTrx(existing.transactionIdNorm || existing.transactionId);
+      if (recv && recv.amount !== undefined && recv.amount !== null
+          && Math.abs(Number(recv.amount) - Number(existing.amount)) >= 0.005
+          && !(req.body && req.body.force === true)) {
+        return safeError(res, 409,
+          `Amount mismatch: TrxID paid Tk ${recv.amount} but the package costs Tk ${existing.amount}.`,
+          { code: 'AMOUNT_MISMATCH', receivedAmount: recv.amount, expectedAmount: existing.amount });
+      }
+    }
     const { payment, subscription, user } = await store.approvePaymentAtomic(Number(req.params.id), req.user.id);
     res.json({ success: true, payment, subscription, user });
   } catch (e) {
@@ -733,6 +910,9 @@ app.post('/api/admin/payments/:id/approve', adminRequired, ah(async (req, res) =
     if (e && e.code === 'NOT_FOUND') return safeError(res, 404, 'Payment not found.');
     if (e && e.code === 'USER_NOT_FOUND') return safeError(res, 404, 'User not found.');
     if (e && e.code === 'PACKAGE_GONE') return safeError(res, 400, 'Package no longer exists.');
+    if (e && e.code === 'AMOUNT_MISMATCH') {
+      return safeError(res, 409, e.message, { code: 'AMOUNT_MISMATCH' });
+    }
     throw e;
   }
 }));

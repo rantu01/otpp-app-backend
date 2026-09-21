@@ -73,6 +73,14 @@ async function getModels() {
       accessEnabled: { type: Boolean, default: true },
       deviceId: { type: String, default: null },
       deviceIdNorm: { type: String, default: null },
+      // Single active session per account: only one device may hold a live
+      // login at a time. activeSessionId is the JWT jti of the current
+      // session; activeDeviceId is its normalized device key. Cleared on
+      // logout (POST /api/auth/logout) or by admin device reset so another
+      // device can log in afterwards.
+      activeSessionId: { type: String, default: null },
+      activeDeviceId: { type: String, default: null },
+      lastLoginAt: { type: String, default: null },
       currentPackageId: { type: Number, default: null },
       currentPackageName: { type: String, default: null },
       packageStartDate: { type: String, default: null },

@@ -41,9 +41,9 @@ const https = require('https');
 /** Ping interval in minutes. Change 7 -> 10 for every 10 minutes. */
 const KEEPALIVE_INTERVAL_MINUTES = Number(process.env.KEEPALIVE_INTERVAL_MINUTES || 7);
 
-/** Deployed backend base URL (no trailing slash). Set to your Render URL. */
+/** Deployed backend base URL (no trailing slash). Central default in config.js. */
 const KEEPALIVE_URL = String(
-  process.env.KEEPALIVE_URL || process.env.PUBLIC_BASE_URL || ''
+  process.env.KEEPALIVE_URL || process.env.PUBLIC_BASE_URL || require('./config').DEFAULT_API_BASE_URL
 ).trim().replace(/\/+$/, '');
 
 /** Per-ping network timeout in ms. */

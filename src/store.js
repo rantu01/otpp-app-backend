@@ -268,6 +268,17 @@ async function deleteUserById(id) {
   return serialize(doc);
 }
 
+/** Password-only update: the login identity (email/phone) is never touched. */
+async function updateUserPassword(id, passwordHash) {
+  const { OtpUser } = await getModels();
+  const doc = await OtpUser.findOneAndUpdate(
+    { id: Number(id) },
+    { $set: { passwordHash: String(passwordHash) } },
+    { returnDocument: 'after' }
+  ).select(NO_HASH).lean();
+  return serialize(doc);
+}
+
 async function countUsers() {
   const { OtpUser } = await getModels();
   return OtpUser.countDocuments({ role: { $in: ['user', 'free'] } });
@@ -1030,21 +1041,22 @@ function isBkashMethod(payment) {
 }
 
 /**
- * Automatic approval rule — TrxID match is sufficient:
+ * Automatic approval rule — TrxID match PLUS amount match are both required:
  *   received_payments.trxIdNorm === payments.transactionIdNorm
- * Amounts are deliberately NOT compared here (an SMS of Tk 90 still
- * approves a Tk 120 package request when the TrxIDs match exactly).
- *
- * Returns { outcome, payment } with outcome one of:
- *   not_found | already_used | claimed
+ *   AND |received.amount - payment.amount| < 0.005
  * A record is claimable only while UNMATCHED: status pending/verified AND
  * no matchedPaymentId yet (Mongo null-match covers both null and missing).
+ * Amount is checked BEFORE claiming so a wrong-amount SMS is never consumed:
+ * mismatches stay PENDING with an explanatory note for manual review.
+ *
+ * Returns { outcome, payment } with outcome one of:
+ *   not_found | already_used | amount_mismatch | claimed
  * The claim is a single atomic compare-and-swap
  * (-> verified + matchedPaymentId + verifiedBy AUTO), so two racers for
  * the same TrxID cannot both win, and an already-matched record is never
  * reassigned to another payment. No new received_payments record is created.
  */
-async function claimReceivedForPayment(trxNorm, paymentId) {
+async function claimReceivedForPayment(trxNorm, paymentId, expectedAmount) {
   const { OtpReceivedPayment } = await getModels();
   const norm = normalizeRecvTrx(trxNorm);
   if (!norm) return { outcome: 'not_found', payment: null };
@@ -1052,6 +1064,14 @@ async function claimReceivedForPayment(trxNorm, paymentId) {
   if (!rec) return { outcome: 'not_found', payment: null };
   if (rec.matchedPaymentId !== undefined && rec.matchedPaymentId !== null) {
     return { outcome: 'already_used', payment: serialize(rec) };
+  }
+  // Backend amount verification: the SMS amount must equal the package price
+  // the customer is claiming. E.g. package 100 BDT vs SMS 40 BDT -> reject.
+  if (expectedAmount !== undefined && expectedAmount !== null && String(expectedAmount).trim() !== '') {
+    const exp = Number(expectedAmount);
+    if (Number.isFinite(exp) && Math.abs(Number(rec.amount) - exp) >= 0.005) {
+      return { outcome: 'amount_mismatch', payment: serialize(rec) };
+    }
   }
   const updated = await OtpReceivedPayment.findOneAndUpdate(
     {
@@ -1118,8 +1138,16 @@ async function tryAutoApprove(payment) {
       return { auto: false, outcome: 'not_bkash', payment, note: null };
     }
     log(`Searching received_payments.trxIdNorm = ${tid}`);
-    const claim = await claimReceivedForPayment(payment.transactionIdNorm, payment.id);
+    const claim = await claimReceivedForPayment(payment.transactionIdNorm, payment.id, payment.amount);
     if (claim.outcome !== 'claimed') {
+      if (claim.outcome === 'amount_mismatch') {
+        const smsAmt = claim.payment ? claim.payment.amount : '?';
+        const note = `Amount mismatch: this TrxID was paid Tk ${smsAmt} but the package costs Tk ${payment.amount}. Manual review required.`;
+        log(`tid=${tid} amount mismatch (sms=${smsAmt} vs package=${payment.amount}) — staying PENDING`);
+        await stampVerifyNote(payment.id, note);
+        payment = { ...payment, verifyNote: note };
+        return { auto: false, outcome: claim.outcome, payment, note };
+      }
       if (claim.outcome === 'not_found') {
         const note = 'No bKash SMS record for this TrxID yet — waiting for the payment phone to upload it.';
         log(`No matching received payment found (tid=${tid})`);
@@ -1184,7 +1212,7 @@ module.exports = {
   // users
   findUserById, findUserRawById, findUserByLogin, userLoginExists, loginExists,
   findUserByDeviceNorm, findUserByDevice, listUsers, createUser,
-  updateUserById, deleteUserById, countUsers,
+  updateUserById, updateUserPassword, deleteUserById, countUsers,
   // packages / methods
   listPackages, findPackageById, createPackage, updatePackageById, deletePackageById,
   listMethods, findMethodById, createMethod, updateMethodById, deleteMethodById,
