@@ -83,7 +83,13 @@ async function main() {
   const prot = await call(port, 'GET', '/api/protected/demo', null, userTok);
   check('protected API allows active user', prot.status === 200, 'status=' + prot.status);
 
-  const ver = await call(port, 'GET', '/api/versions/check?platform=android&version=1.2.0', null, null);
+  const published = await call(port, 'PUT', '/api/admin/versions/android', {
+    latestVersion: '2.0.0', latestVersionCode: 99,
+    minimumSupportedVersion: '1.0.0', updateRequired: true,
+    updateUrl: 'https://example.com/otp-release.apk', message: 'Update available.'
+  }, adminTok);
+  check('publish version metadata', published.status === 200, JSON.stringify(published.json).slice(0, 100));
+  const ver = await call(port, 'GET', '/api/versions/check?platform=android&version=1.2.0&versionCode=2', null, null);
   check('force update for old version', ver.json.forceUpdate === true, JSON.stringify(ver.json).slice(0, 100));
 
   const dash = await call(port, 'GET', '/api/admin/dashboard', null, adminTok);

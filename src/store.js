@@ -696,7 +696,7 @@ async function upsertVersion(platform, patch) {
   const id = await nextId('appVersion');
   try {
     const created = await OtpVersion.create({
-      id, platform: plat, latestVersion: '1.0.0', minimumSupportedVersion: '1.0.0',
+      id, platform: plat, latestVersion: '1.0.0', latestVersionCode: 1, minimumSupportedVersion: '1.0.0',
       updateRequired: false, updateUrl: '', message: '', updatedAt: nowIso(), ...patch,
     });
     return serialize(created.toObject());

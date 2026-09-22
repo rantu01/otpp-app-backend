@@ -104,6 +104,7 @@ async function ensureVersion(models) {
       id,
       platform: 'android',
       latestVersion: '1.5.0',
+      latestVersionCode: 1,
       minimumSupportedVersion: '1.3.0',
       updateRequired: false,
       updateUrl: '',

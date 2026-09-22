@@ -245,6 +245,7 @@ async function getModels() {
       id: { type: Number, required: true, unique: true },
       platform: { type: String, required: true, unique: true },
       latestVersion: { type: String, default: '1.0.0' },
+      latestVersionCode: { type: Number, default: 1, min: 1 },
       minimumSupportedVersion: { type: String, default: '1.0.0' },
       updateRequired: { type: Boolean, default: false },
       updateUrl: { type: String, default: '' },

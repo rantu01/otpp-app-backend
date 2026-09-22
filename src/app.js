@@ -118,19 +118,24 @@ app.get('/api/versions/check', ah(async (req, res) => {
   await ensureMongo();
   const platform = String(req.query.platform || 'android').toLowerCase();
   const installed = String(req.query.version || '0');
+  const installedCode = Math.max(0, Number.parseInt(String(req.query.versionCode || '0'), 10) || 0);
   const v = (await store.findVersion(platform)) || (await store.findFirstVersion()) || null;
-  if (!v) return res.json({ success: true, forceUpdate: false, installed });
+  if (!v) return res.json({ success: true, forceUpdate: false, updateAvailable: false, installed, installedCode });
   const belowMin = store.cmpVersions(installed, v.minimumSupportedVersion) < 0;
-  const behind = store.cmpVersions(installed, v.latestVersion) < 0;
+  const behindVersion = store.cmpVersions(installed, v.latestVersion) < 0;
+  const behindCode = installedCode > 0 && installedCode < Number(v.latestVersionCode || 1);
+  const behind = behindVersion || behindCode;
   const forceUpdate = belowMin || (behind && !!v.updateRequired);
   res.json({
     success: true,
     installed,
     latestVersion: v.latestVersion,
+    latestVersionCode: Number(v.latestVersionCode || 1),
     minimumSupportedVersion: v.minimumSupportedVersion,
     updateRequired: !!v.updateRequired,
     updateUrl: v.updateUrl || '',
     message: v.message || '',
+    updateAvailable: behind,
     forceUpdate,
     blocked: belowMin,
   });
@@ -954,8 +959,29 @@ app.get('/api/admin/versions', adminRequired, ah(async (req, res) => {
 }));
 app.put('/api/admin/versions/:platform', adminRequired, ah(async (req, res) => {
   const patch = {};
-  for (const k of ['latestVersion', 'minimumSupportedVersion', 'updateUrl', 'message']) {
-    if (req.body[k] !== undefined) patch[k] = String(req.body[k]);
+  const semver = /^\d+\.\d+\.\d+$/;
+  for (const k of ['latestVersion', 'minimumSupportedVersion']) {
+    if (req.body[k] !== undefined) {
+      const value = String(req.body[k]).trim();
+      if (!semver.test(value)) return safeError(res, 400, `${k} must use semantic version format x.y.z.`);
+      patch[k] = value;
+    }
+  }
+  if (req.body.latestVersionCode !== undefined) {
+    const code = Number(req.body.latestVersionCode);
+    if (!Number.isInteger(code) || code < 1) return safeError(res, 400, 'latestVersionCode must be a positive integer.');
+    patch.latestVersionCode = code;
+  }
+  if (req.body.updateUrl !== undefined) {
+    const value = String(req.body.updateUrl).trim();
+    if (value.length > 500) return safeError(res, 400, 'updateUrl is too long.');
+    if (value && !/^https:\/\//i.test(value)) return safeError(res, 400, 'updateUrl must use HTTPS.');
+    patch.updateUrl = value;
+  }
+  if (req.body.message !== undefined) {
+    const value = String(req.body.message).trim();
+    if (value.length > 1000) return safeError(res, 400, 'message is too long.');
+    patch.message = value;
   }
   if (req.body.updateRequired !== undefined) patch.updateRequired = !!req.body.updateRequired;
   const v = await store.upsertVersion(String(req.params.platform || 'android'), patch);
