@@ -15,4 +15,10 @@ function getPublicBaseUrl() {
   return DEFAULT_API_BASE_URL;
 }
 
-module.exports = { DEFAULT_API_BASE_URL, getPublicBaseUrl };
+const cloudinaryConfig = {
+  cloudName: process.env.CLOUDINARY_CLOUD_NAME,
+  apiKey: process.env.CLOUDINARY_API_KEY,
+  apiSecret: process.env.CLOUDINARY_API_SECRET,
+};
+
+module.exports = { DEFAULT_API_BASE_URL, getPublicBaseUrl, cloudinaryConfig };

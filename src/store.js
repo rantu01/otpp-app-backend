@@ -1207,15 +1207,7 @@ function sanitizeFileName(name) {
 }
 
 async function ensureReleasesDir() {
-  const fs = require('fs');
-  const path = require('path');
-  const dir = APP_RELEASES_DIR || path.join(__dirname, '..', 'Letest_v');
-  try {
-    await fs.promises.mkdir(dir, { recursive: true });
-  } catch (e) {
-    if (e && e.code !== 'EEXIST') throw e;
-  }
-  return dir;
+  return APP_RELEASES_DIR || require('path').join(__dirname, '..', 'uploads');
 }
 
 async function listReleases() {

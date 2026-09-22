@@ -281,21 +281,22 @@ async function getModels() {
      { collection: 'fcmtokens', versionKey: false, strict: true }
    );
 
-   const appReleaseSchema = new Schema(
-     {
-       id: { type: Number, required: true, unique: true },
-       versionName: { type: String, required: true },
-       versionCode: { type: Number, required: true, min: 1 },
-       apkFileName: { type: String, required: true },
-       apkPath: { type: String, required: true },
-       releaseNotes: { type: String, default: '' },
-       updateRequired: { type: Boolean, default: false },
-       isPublished: { type: Boolean, default: true },
-       createdAt: { type: String, default: isoNow },
-       publishedAt: { type: String, default: null },
-     },
-     { collection: 'appreleases', versionKey: false, strict: true }
-   );
+    const appReleaseSchema = new Schema(
+      {
+        id: { type: Number, required: true, unique: true },
+        versionName: { type: String, required: true },
+        versionCode: { type: Number, required: true, min: 1 },
+        apkFileName: { type: String, required: true },
+        apkUrl: { type: String },
+        apkPath: { type: String },
+        releaseNotes: { type: String, default: '' },
+        updateRequired: { type: Boolean, default: false },
+        isPublished: { type: Boolean, default: true },
+        createdAt: { type: String, default: isoNow },
+        publishedAt: { type: String, default: null },
+      },
+      { collection: 'appreleases', versionKey: false, strict: true }
+    );
    appReleaseSchema.index({ versionCode: -1 });
    appReleaseSchema.index({ isPublished: 1, versionCode: -1 });
 

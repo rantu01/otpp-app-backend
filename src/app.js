@@ -22,6 +22,8 @@ const express = require('express');
 const cors = require('cors');
 const crypto = require('crypto');
 const store = require('./store');
+const cloudinary = require('cloudinary').v2;
+const { cloudinaryConfig } = require('./config');
 const { ensureMongo, isConnected, getDbName } = require('./mongo');
 const { hashPassword, verifyPassword, signToken, authRequired, adminRequired, accessRequired, notBlockedRequired, evaluateAccess, publicUser } = require('./auth');
 
@@ -39,7 +41,12 @@ const sec = installSecurity(app, cors);
 }
 app.use(express.json({ limit: '1mb' }));
 const multer = require('multer');
-const apkUpload = multer().single('apk');
+const apkUpload = multer({ storage: multer.memoryStorage() }).single('apk');
+cloudinary.config({
+  cloud_name: cloudinaryConfig.cloudName,
+  api_key: cloudinaryConfig.apiKey,
+  api_secret: cloudinaryConfig.apiSecret,
+});
 
 const safeError = (res, status, message, extra) =>
   res.status(status).json(Object.assign({ success: false, error: message }, extra || {}));
@@ -993,7 +1000,7 @@ app.put('/api/admin/versions/:platform', adminRequired, ah(async (req, res) => {
 const path = require('path');
 const fs = require('fs');
 
-// ---------------- app updates (APK filesystem + MongoDB metadata) ----------------
+// ---------------- app updates (Cloudinary APK storage + MongoDB metadata) ----------------
 
 app.get('/api/app-update/latest', ah(async (req, res) => {
   await ensureMongo();
@@ -1006,7 +1013,7 @@ app.get('/api/app-update/latest', ah(async (req, res) => {
     updateAvailable: true,
     versionName: latest.versionName,
     versionCode: latest.versionCode,
-    downloadUrl: `/api/app-update/download/${latest.versionCode}`,
+    downloadUrl: latest.apkUrl || `/api/app-update/download/${latest.versionCode}`,
     releaseNotes: latest.releaseNotes || '',
     updateRequired: !!latest.updateRequired,
     apkFileName: latest.apkFileName,
@@ -1021,6 +1028,11 @@ app.get('/api/app-update/download/:versionCode', ah(async (req, res) => {
   }
   const release = await store.findPublishedRelease(versionCode);
   if (!release) return safeError(res, 404, 'Release not found.');
+  if (release.apkUrl) {
+    return res.redirect(302, release.apkUrl);
+  }
+  // Backward compatibility for legacy records stored on a local filesystem.
+  if (!release.apkPath) return safeError(res, 404, 'APK file not found.');
   const filePath = path.resolve(release.apkPath);
   if (!fs.existsSync(filePath)) return safeError(res, 404, 'APK file not found.');
   res.setHeader('Content-Type', 'application/vnd.android.package-archive');
@@ -1040,46 +1052,44 @@ app.post('/api/app-update/upload', adminRequired, ah(async (req, res) => {
     const extOk = fileName.toLowerCase().endsWith('.apk');
     const mimeOk = mimeType === 'application/vnd.android.package-archive' || mimeType === 'application/octet-stream';
     if (!extOk && !mimeOk) {
-      try { fs.unlinkSync(req.file.path); } catch { /* ignore */ }
       return safeError(res, 400, 'Only .apk files are accepted.');
     }
     // Validate version fields
     const vName = String(versionName || '').trim();
     if (!vName) {
-      try { fs.unlinkSync(req.file.path); } catch { /* ignore */ }
       return safeError(res, 400, 'Version Name is required.');
     }
     const vCode = Number(versionCode);
     if (!Number.isInteger(vCode) || vCode < 1) {
-      try { fs.unlinkSync(req.file.path); } catch { /* ignore */ }
       return safeError(res, 400, 'Version Code must be a positive integer.');
     }
     // Ensure version code is greater than the latest published
     const current = await store.findLatestPublishedRelease();
     if (current && vCode <= current.versionCode) {
-      try { fs.unlinkSync(req.file.path); } catch { /* ignore */ }
       return safeError(res, 409, `Version Code must be greater than the current published code (${current.versionCode}).`);
     }
     // Prevent duplicate version code
     const existing = await store.findPublishedRelease(vCode);
     if (existing) {
-      try { fs.unlinkSync(req.file.path); } catch { /* ignore */ }
       return safeError(res, 409, 'A release with this Version Code already exists.');
     }
-    // Store APK in version-specific folder
-    const releasesDir = await store.ensureReleasesDir();
-    const versionDir = path.join(releasesDir, `V${vCode}`);
-    fs.mkdirSync(versionDir, { recursive: true });
+    // Upload APK to Cloudinary as raw resource (never stored on local filesystem)
     const safeName = `Nesa ${vName}.apk`;
-    const destPath = path.join(versionDir, safeName);
-    fs.renameSync(req.file.path, destPath);
-    const relativePath = path.relative(path.join(releasesDir, '..'), destPath);
+    const publicId = `otp-app/apk/V${vCode}/${vName}`;
+    const uploadResult = await cloudinary.uploader.upload(req.file.buffer, {
+      resource_type: 'raw',
+      public_id: publicId,
+      overwrite: true,
+      use_filename: false,
+      folder: 'otp-app/apk',
+    });
     const publishedAt = store.nowIso();
     const release = await store.createRelease({
       versionName: vName,
       versionCode: vCode,
       apkFileName: safeName,
-      apkPath: relativePath,
+      apkUrl: uploadResult.secure_url,
+      apkPath: uploadResult.public_id,
       releaseNotes: String(releaseNotes || ''),
       updateRequired: updateRequired === 'true' || updateRequired === true,
       isPublished: true,
@@ -1092,6 +1102,7 @@ app.post('/api/app-update/upload', adminRequired, ah(async (req, res) => {
         versionName: release.versionName,
         versionCode: release.versionCode,
         apkFileName: release.apkFileName,
+        apkUrl: release.apkUrl,
         releaseNotes: release.releaseNotes,
         updateRequired: release.updateRequired,
         isPublished: release.isPublished,
