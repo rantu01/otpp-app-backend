@@ -211,12 +211,12 @@ app.post('/api/auth/login', ah(async (req, res) => {
   // successfully log in from (password already verified above).
   const reqDevice = normalizeDeviceId(req.body.deviceId);
   if (user.role !== 'admin') {
-    // One device per account: a live session on another device blocks this
-    // login until that device logs out (which clears the session server-side
-    // and lets the new device adopt the account below).
+    // One device per account: a live session on another device is
+    // terminated so the new device can log in (previous token invalidated).
     const block = singleSessionBlock(user, reqDevice);
     if (block) {
-      return safeError(res, 409, block.message, { code: block.code });
+      await store.updateUserById(user.id, { activeSessionId: null, activeDeviceId: null });
+      user = await store.findUserById(user.id);
     }
     if (user.deviceId && reqDevice && normalizeDeviceId(user.deviceId) !== reqDevice && !user.activeSessionId) {
       // Logged out earlier on another device: adopt the new device.
