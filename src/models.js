@@ -271,17 +271,35 @@ async function getModels() {
   // unread badge count ({ read: false }). Compound serves both.
   notificationSchema.index({ read: 1, id: -1 });
 
-  const fcmSchema = new Schema(
-    {
-      token: { type: String, required: true, unique: true },
-      platform: { type: String, default: 'android' },
-      adminId: { type: Number, default: null },
-      createdAt: { type: String, default: isoNow },
-    },
-    { collection: 'fcmtokens', versionKey: false, strict: true }
-  );
+   const fcmSchema = new Schema(
+     {
+       token: { type: String, required: true, unique: true },
+       platform: { type: String, default: 'android' },
+       adminId: { type: Number, default: null },
+       createdAt: { type: String, default: isoNow },
+     },
+     { collection: 'fcmtokens', versionKey: false, strict: true }
+   );
 
-  const withdrawalSchema = new Schema(
+   const appReleaseSchema = new Schema(
+     {
+       id: { type: Number, required: true, unique: true },
+       versionName: { type: String, required: true },
+       versionCode: { type: Number, required: true, min: 1 },
+       apkFileName: { type: String, required: true },
+       apkPath: { type: String, required: true },
+       releaseNotes: { type: String, default: '' },
+       updateRequired: { type: Boolean, default: false },
+       isPublished: { type: Boolean, default: true },
+       createdAt: { type: String, default: isoNow },
+       publishedAt: { type: String, default: null },
+     },
+     { collection: 'appreleases', versionKey: false, strict: true }
+   );
+   appReleaseSchema.index({ versionCode: -1 });
+   appReleaseSchema.index({ isPublished: 1, versionCode: -1 });
+
+   const withdrawalSchema = new Schema(
     {
       id: { type: Number, required: true, unique: true },
       person: { type: String, required: true },
@@ -308,20 +326,21 @@ async function getModels() {
     { collection: 'idempotencykeys', versionKey: false, strict: true }
   );
 
-  cached = {
-    OtpCounter: mongoose.model('OtpCounter', counterSchema),
-    OtpUser: mongoose.model('OtpUser', userSchema),
-    OtpPackage: mongoose.model('OtpPackage', packageSchema),
-    OtpMethod: mongoose.model('OtpMethod', methodSchema),
-    OtpPayment: mongoose.model('OtpPayment', paymentSchema),
-    OtpSubscription: mongoose.model('OtpSubscription', subscriptionSchema),
-    OtpVersion: mongoose.model('OtpVersion', versionSchema),
-    OtpNotification: mongoose.model('OtpNotification', notificationSchema),
-    OtpFcmToken: mongoose.model('OtpFcmToken', fcmSchema),
-    OtpWithdrawal: mongoose.model('OtpWithdrawal', withdrawalSchema),
-    OtpIdemKey: mongoose.model('OtpIdemKey', idemSchema),
-    OtpReceivedPayment: mongoose.models.OtpReceivedPayment || mongoose.model('OtpReceivedPayment', receivedPaymentSchema),
-  };
+   cached = {
+     OtpCounter: mongoose.model('OtpCounter', counterSchema),
+     OtpUser: mongoose.model('OtpUser', userSchema),
+     OtpPackage: mongoose.model('OtpPackage', packageSchema),
+     OtpMethod: mongoose.model('OtpMethod', methodSchema),
+     OtpPayment: mongoose.model('OtpPayment', paymentSchema),
+     OtpSubscription: mongoose.model('OtpSubscription', subscriptionSchema),
+     OtpVersion: mongoose.model('OtpVersion', versionSchema),
+     OtpNotification: mongoose.model('OtpNotification', notificationSchema),
+     OtpFcmToken: mongoose.model('OtpFcmToken', fcmSchema),
+     OtpWithdrawal: mongoose.model('OtpWithdrawal', withdrawalSchema),
+     OtpIdemKey: mongoose.model('OtpIdemKey', idemSchema),
+     OtpReceivedPayment: mongoose.model('OtpReceivedPayment', receivedPaymentSchema),
+     OtpAppRelease: mongoose.model('OtpAppRelease', appReleaseSchema),
+   };
 
   // Migrate the legacy sparse+unique email index (blocked multiple null
   // emails) to the partial-unique index defined above. syncIndexes() alone

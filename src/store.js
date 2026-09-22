@@ -1194,6 +1194,74 @@ async function tryAutoApprove(payment) {
   }
 }
 
+/* ---------- app releases (APK files on filesystem, metadata in MongoDB) ---------- */
+
+const APP_RELEASES_DIR = process.env.APP_RELEASES_DIR || '';
+
+function sanitizeFileName(name) {
+  return String(name || '')
+    .replace(/[^a-zA-Z0-9._-]/g, '_')
+    .replace(/_{2,}/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 120);
+}
+
+async function ensureReleasesDir() {
+  const fs = require('fs');
+  const path = require('path');
+  const dir = APP_RELEASES_DIR || path.join(__dirname, '..', 'Letest_v');
+  try {
+    await fs.promises.mkdir(dir, { recursive: true });
+  } catch (e) {
+    if (e && e.code !== 'EEXIST') throw e;
+  }
+  return dir;
+}
+
+async function listReleases() {
+  const { OtpAppRelease } = await getModels();
+  const docs = await OtpAppRelease.find({}).sort({ versionCode: -1 }).lean();
+  return serialize(docs);
+}
+
+async function findPublishedRelease(versionCode) {
+  const { OtpAppRelease } = await getModels();
+  const doc = await OtpAppRelease.findOne({ versionCode: Number(versionCode), isPublished: true }).lean();
+  return serialize(doc);
+}
+
+async function findLatestPublishedRelease() {
+  const { OtpAppRelease } = await getModels();
+  const doc = await OtpAppRelease.findOne({ isPublished: true }).sort({ versionCode: -1 }).lean();
+  return serialize(doc);
+}
+
+async function createRelease(data) {
+  const { OtpAppRelease } = await getModels();
+  const id = await nextId('appRelease');
+  const doc = await OtpAppRelease.create({ id, createdAt: nowIso(), publishedAt: null, ...data, id });
+  clearVersionCache();
+  return serialize(doc);
+}
+
+async function updateRelease(versionCode, patch) {
+  const { OtpAppRelease } = await getModels();
+  const doc = await OtpAppRelease.findOneAndUpdate(
+    { versionCode: Number(versionCode) },
+    { $set: patch },
+    { returnDocument: 'after' }
+  ).lean();
+  clearVersionCache();
+  return serialize(doc);
+}
+
+async function deleteRelease(versionCode) {
+  const { OtpAppRelease } = await getModels();
+  const doc = await OtpAppRelease.findOneAndDelete({ versionCode: Number(versionCode) }).lean();
+  clearVersionCache();
+  return serialize(doc);
+}
+
 /* ---------- misc ---------- */
 
 function activationWindow(user, durationDays, nowMs) {
@@ -1226,6 +1294,9 @@ module.exports = {
   listNotifications, countUnreadNotifications, createNotification, markAllNotificationsRead,
   addFcmToken, countFcmTokens, listVersions, findVersion, findFirstVersion, upsertVersion,
   clearVersionCache,
+  // app releases
+  listReleases, findPublishedRelease, findLatestPublishedRelease, createRelease, updateRelease, deleteRelease,
+  ensureReleasesDir, sanitizeFileName,
   // withdrawals / profit
   listWithdrawals, createWithdrawal, dashboardStats,
   // idempotency

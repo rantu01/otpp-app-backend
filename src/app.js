@@ -38,6 +38,8 @@ const sec = installSecurity(app, cors);
   }
 }
 app.use(express.json({ limit: '1mb' }));
+const multer = require('multer');
+const apkUpload = multer().single('apk');
 
 const safeError = (res, status, message, extra) =>
   res.status(status).json(Object.assign({ success: false, error: message }, extra || {}));
@@ -986,6 +988,142 @@ app.put('/api/admin/versions/:platform', adminRequired, ah(async (req, res) => {
   if (req.body.updateRequired !== undefined) patch.updateRequired = !!req.body.updateRequired;
   const v = await store.upsertVersion(String(req.params.platform || 'android'), patch);
   res.json({ success: true, version: v });
+}));
+
+const path = require('path');
+const fs = require('fs');
+
+// ---------------- app updates (APK filesystem + MongoDB metadata) ----------------
+
+app.get('/api/app-update/latest', ah(async (req, res) => {
+  await ensureMongo();
+  const latest = await store.findLatestPublishedRelease();
+  if (!latest) {
+    return res.json({ success: true, updateAvailable: false });
+  }
+  res.json({
+    success: true,
+    updateAvailable: true,
+    versionName: latest.versionName,
+    versionCode: latest.versionCode,
+    downloadUrl: `/api/app-update/download/${latest.versionCode}`,
+    releaseNotes: latest.releaseNotes || '',
+    updateRequired: !!latest.updateRequired,
+    apkFileName: latest.apkFileName,
+  });
+}));
+
+app.get('/api/app-update/download/:versionCode', ah(async (req, res) => {
+  await ensureMongo();
+  const versionCode = Number(req.params.versionCode);
+  if (!Number.isInteger(versionCode) || versionCode < 1) {
+    return safeError(res, 400, 'Invalid version code.');
+  }
+  const release = await store.findPublishedRelease(versionCode);
+  if (!release) return safeError(res, 404, 'Release not found.');
+  const filePath = path.resolve(release.apkPath);
+  if (!fs.existsSync(filePath)) return safeError(res, 404, 'APK file not found.');
+  res.setHeader('Content-Type', 'application/vnd.android.package-archive');
+  res.setHeader('Content-Disposition', `attachment; filename="${release.apkFileName}"`);
+  fs.createReadStream(filePath).pipe(res);
+}));
+
+app.post('/api/app-update/upload', adminRequired, ah(async (req, res) => {
+  await ensureMongo();
+  apkUpload(req, res, async (err) => {
+    if (err) return safeError(res, 400, 'Upload failed: ' + err.message);
+    const { versionName, versionCode, releaseNotes, updateRequired } = req.body || {};
+    // Validate APK file
+    if (!req.file) return safeError(res, 400, 'APK file is required.');
+    const fileName = req.file.originalname || '';
+    if (!fileName.toLowerCase().endsWith('.apk')) {
+      try { fs.unlinkSync(req.file.path); } catch { /* ignore */ }
+      return safeError(res, 400, 'Only .apk files are accepted.');
+    }
+    // Validate version fields
+    const vName = String(versionName || '').trim();
+    if (!vName) {
+      try { fs.unlinkSync(req.file.path); } catch { /* ignore */ }
+      return safeError(res, 400, 'Version Name is required.');
+    }
+    const vCode = Number(versionCode);
+    if (!Number.isInteger(vCode) || vCode < 1) {
+      try { fs.unlinkSync(req.file.path); } catch { /* ignore */ }
+      return safeError(res, 400, 'Version Code must be a positive integer.');
+    }
+    // Ensure version code is greater than the latest published
+    const current = await store.findLatestPublishedRelease();
+    if (current && vCode <= current.versionCode) {
+      try { fs.unlinkSync(req.file.path); } catch { /* ignore */ }
+      return safeError(res, 409, `Version Code must be greater than the current published code (${current.versionCode}).`);
+    }
+    // Prevent duplicate version code
+    const existing = await store.findPublishedRelease(vCode);
+    if (existing) {
+      try { fs.unlinkSync(req.file.path); } catch { /* ignore */ }
+      return safeError(res, 409, 'A release with this Version Code already exists.');
+    }
+    // Store APK in version-specific folder
+    const releasesDir = await store.ensureReleasesDir();
+    const versionDir = path.join(releasesDir, `V${vCode}`);
+    fs.mkdirSync(versionDir, { recursive: true });
+    const safeName = `Nesa ${vName}.apk`;
+    const destPath = path.join(versionDir, safeName);
+    fs.renameSync(req.file.path, destPath);
+    const relativePath = path.relative(path.join(releasesDir, '..'), destPath);
+    const publishedAt = store.nowIso();
+    const release = await store.createRelease({
+      versionName: vName,
+      versionCode: vCode,
+      apkFileName: safeName,
+      apkPath: relativePath,
+      releaseNotes: String(releaseNotes || ''),
+      updateRequired: updateRequired === 'true' || updateRequired === true,
+      isPublished: true,
+      publishedAt,
+    });
+    res.json({
+      success: true,
+      message: 'Update published successfully.',
+      release: {
+        versionName: release.versionName,
+        versionCode: release.versionCode,
+        apkFileName: release.apkFileName,
+        releaseNotes: release.releaseNotes,
+        updateRequired: release.updateRequired,
+        isPublished: release.isPublished,
+        publishedAt: release.publishedAt,
+      },
+    });
+  });
+}));
+
+app.get('/api/app-update/history', adminRequired, ah(async (req, res) => {
+  await ensureMongo();
+  const list = await store.listReleases();
+  res.json({ success: true, releases: list });
+}));
+
+app.patch('/api/app-update/:versionCode', adminRequired, ah(async (req, res) => {
+  await ensureMongo();
+  const versionCode = Number(req.params.versionCode);
+  if (!Number.isInteger(versionCode) || versionCode < 1) return safeError(res, 400, 'Invalid version code.');
+  const patch = {};
+  if (req.body.releaseNotes !== undefined) patch.releaseNotes = String(req.body.releaseNotes);
+  if (req.body.updateRequired !== undefined) patch.updateRequired = !!req.body.updateRequired;
+  if (req.body.isPublished !== undefined) patch.isPublished = !!req.body.isPublished;
+  const updated = await store.updateRelease(versionCode, patch);
+  if (!updated) return safeError(res, 404, 'Release not found.');
+  res.json({ success: true, release: updated });
+}));
+
+app.delete('/api/app-update/:versionCode', adminRequired, ah(async (req, res) => {
+  await ensureMongo();
+  const versionCode = Number(req.params.versionCode);
+  if (!Number.isInteger(versionCode) || versionCode < 1) return safeError(res, 400, 'Invalid version code.');
+  const removed = await store.deleteRelease(versionCode);
+  if (!removed) return safeError(res, 404, 'Release not found.');
+  res.json({ success: true, removed });
 }));
 
 // ---------------- received bKash SMS payments (Recive payment app) ----------------
