@@ -1036,7 +1036,10 @@ app.post('/api/app-update/upload', adminRequired, ah(async (req, res) => {
     // Validate APK file
     if (!req.file) return safeError(res, 400, 'APK file is required.');
     const fileName = req.file.originalname || '';
-    if (!fileName.toLowerCase().endsWith('.apk')) {
+    const mimeType = req.file.mimetype || '';
+    const extOk = fileName.toLowerCase().endsWith('.apk');
+    const mimeOk = mimeType === 'application/vnd.android.package-archive' || mimeType === 'application/octet-stream';
+    if (!extOk && !mimeOk) {
       try { fs.unlinkSync(req.file.path); } catch { /* ignore */ }
       return safeError(res, 400, 'Only .apk files are accepted.');
     }
