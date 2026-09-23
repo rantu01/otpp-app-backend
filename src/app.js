@@ -753,7 +753,11 @@ app.patch('/api/admin/users/:id/access', adminRequired, ah(async (req, res) => {
     const r = String(req.body.role).toLowerCase();
     if (!['user', 'free'].includes(r)) return safeError(res, 400, "role must be 'user' or 'free'.");
     patch.role = r;
-    if (r === 'free' && !user.currentPackageName) patch.currentPackageName = 'Free';
+    if (r === 'free') {
+      patch.status = 'active';
+      patch.accessEnabled = true;
+      if (!user.currentPackageName) patch.currentPackageName = 'Free';
+    }
   }
   const updated = await store.updateUserById(user.id, patch);
   res.json({ success: true, user: publicUser(updated), access: evaluateAccess(null, updated) });
