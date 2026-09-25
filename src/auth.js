@@ -102,6 +102,20 @@ function evaluateAccess(dbOrNull, user) {
     };
   }
   const exp = user.packageExpireDate ? Date.parse(user.packageExpireDate) : NaN;
+  const trialExp = user.freeTrialExpiresAt ? Date.parse(user.freeTrialExpiresAt) : NaN;
+  if (Number.isFinite(trialExp) && trialExp > now && (!user.currentPackageId || Number.isNaN(exp) || exp <= now)) {
+    return {
+      allowed: true,
+      reason: 'REFERRAL_FREE',
+      message: 'Referral free access granted.',
+      packageId: null,
+      packageName: 'Referral free access',
+      packageExpireDate: user.freeTrialExpiresAt,
+      freeTrialExpiresAt: user.freeTrialExpiresAt,
+      freeTrialDays: Number(user.freeTrialDays || 0),
+      free: true,
+    };
+  }
   if (!user.currentPackageId || Number.isNaN(exp) || exp <= now) {
     return { allowed: false, reason: 'NO_PACKAGE', message: 'No active package. Please choose a package.' };
   }

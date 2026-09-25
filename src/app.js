@@ -77,6 +77,7 @@ app.use('/api/subscriptions', requireMongo);
 app.use('/api/admin', requireMongo);
 app.use('/api/protected', requireMongo);
 app.use('/api/received-payments', requireMongo);
+app.use('/api/referrals', requireMongo);
 
 /** Device IDs: case-insensitive, punctuation-insensitive. */
 const normalizeDeviceId = (s) => String(s || '').trim().toLowerCase().replace(/[^a-z0-9]/g, '');
@@ -152,12 +153,20 @@ app.get('/api/versions/check', ah(async (req, res) => {
 
 // ---------------- auth ----------------
 app.post('/api/auth/register', ah(async (req, res) => {
-  const { name, email, phone, password } = req.body || {};
+  const { name, email, phone, password, referralCode } = req.body || {};
   if (!password || String(password).length < 4) return safeError(res, 400, 'Password must be at least 4 characters.');
   const login = String(email || phone || '').trim().toLowerCase();
   if (!login) return safeError(res, 400, 'Email or phone is required.');
   if (await store.loginExists(login)) {
     return safeError(res, 409, 'Account already exists. Please login.');
+  }
+  let referrer = null;
+  if (referralCode) {
+    if (!store.referralConfig().enabled) return safeError(res, 400, 'Referral invites are currently disabled.');
+    referrer = await store.findUserByReferralCode(referralCode);
+    if (!referrer || referrer.status !== 'active' || referrer.accessEnabled === false) {
+      return safeError(res, 400, 'That referral code is invalid or inactive.', { code: 'INVALID_REFERRAL_CODE' });
+    }
   }
   let user;
   try {
@@ -176,6 +185,7 @@ app.post('/api/auth/register', ah(async (req, res) => {
       currentPackageName: null,
       packageStartDate: null,
       packageExpireDate: null,
+      referredBy: referrer ? referrer.id : null,
       createdAt: store.nowIso(),
     });
   } catch (e) {
@@ -194,6 +204,16 @@ app.post('/api/auth/register', ah(async (req, res) => {
     ...(devNorm ? { deviceId: devNorm, deviceIdNorm: store.deviceKey(devNorm) } : {}),
     lastLoginAt: store.nowIso(),
   });
+  if (referrer) {
+    const referral = await store.createReferral({
+      referrerUserId: referrer.id,
+      referredUserId: user.id,
+      referralCode: referrer.referralCode,
+      status: 'pending',
+      createdAt: store.nowIso(),
+    });
+    if (referral && referral.created) await store.incrementUserCounters(referrer.id, { referralCount: 1 });
+  }
   res.status(201).json({ success: true, token: signToken(user, sid), user: publicUser(user), access: evaluateAccess(null, user) });
 }));
 
@@ -287,6 +307,20 @@ app.get('/api/auth/me', notBlockedRequired, (req, res) => {
   if (!req.user) return safeError(res, 401, 'Account not found.', { code: 'NO_ACCOUNT' });
   res.json({ success: true, user: publicUser(req.user), access: evaluateAccess(null, req.user) });
 });
+
+app.get('/api/referrals/me', authRequired, ah(async (req, res) => {
+  if (req.user.role === 'admin') return safeError(res, 403, 'Referral data is only available for customer accounts.');
+  res.json({ success: true, referral: await store.getMyReferral(req.user.id) });
+}));
+
+app.get('/api/admin/referrals/stats', adminRequired, ah(async (req, res) => {
+  res.json({ success: true, stats: await store.referralStats() });
+}));
+
+app.get('/api/admin/referrals', adminRequired, ah(async (req, res) => {
+  const paged = await store.listReferrals(req.query);
+  res.json({ success: true, ...paged });
+}));
 
 // Logout: clears the live session so the SAME account can log in from another
 // device afterwards. Without this, single-session blocking would be permanent.
@@ -760,6 +794,7 @@ app.patch('/api/admin/users/:id/access', adminRequired, ah(async (req, res) => {
     }
   }
   const updated = await store.updateUserById(user.id, patch);
+  if (updated && updated.status === 'active') await store.verifyReferralForUser(updated.id);
   res.json({ success: true, user: publicUser(updated), access: evaluateAccess(null, updated) });
 }));
 

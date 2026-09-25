@@ -11,6 +11,7 @@
  * stable API-facing identifier.
  */
 const { ensureMongo } = require('./mongo');
+const crypto = require('crypto');
 
 let cached = null;
 let backfilled = false;
@@ -44,11 +45,36 @@ async function backfillDeviceNorms(models) {
   return missing.length;
 }
 
+async function backfillReferralCodes(models) {
+  const missing = await models.OtpUser.find({ $or: [{ referralCode: null }, { referralCode: { $exists: false } }] }, { _id: 1 }).lean();
+  if (!missing.length) return 0;
+  const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  let count = 0;
+  for (const user of missing) {
+    let code = '';
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      const bytes = crypto.randomBytes(8);
+      code = 'OTP' + Array.from(bytes, (byte) => alphabet[byte % alphabet.length]).join('');
+      try {
+        const result = await models.OtpUser.updateOne(
+          { _id: user._id, $or: [{ referralCode: null }, { referralCode: { $exists: false } }] },
+          { $set: { referralCode: code } }
+        );
+        if (result.modifiedCount === 1) { count += 1; break; }
+      } catch (e) {
+        if (!e || e.code !== 11000) throw e;
+      }
+    }
+  }
+  if (count) console.log(`[mongo] backfilled referralCode for ${count} user(s).`);
+  return count;
+}
+
 async function getModels() {
   const mongoose = await ensureMongo();
   if (cached && cached.OtpReceivedPayment) return cached;
   cached = null;
-  if (mongoose.models.OtpUser && mongoose.models.OtpCounter && mongoose.models.OtpReceivedPayment) {
+  if (mongoose.models.OtpUser && mongoose.models.OtpCounter && mongoose.models.OtpReferral && mongoose.models.OtpReceivedPayment) {
     cached = mongoose.models;
     return cached;
   }
@@ -85,6 +111,13 @@ async function getModels() {
       currentPackageName: { type: String, default: null },
       packageStartDate: { type: String, default: null },
       packageExpireDate: { type: String, default: null },
+      referralCode: { type: String, default: null, uppercase: true, trim: true },
+      referredBy: { type: Number, default: null },
+      referralCount: { type: Number, default: 0, min: 0 },
+      successfulReferralCount: { type: Number, default: 0, min: 0 },
+      referralRewardCount: { type: Number, default: 0, min: 0 },
+      freeTrialDays: { type: Number, default: 0, min: 0 },
+      freeTrialExpiresAt: { type: String, default: null },
       createdAt: { type: String, default: isoNow },
     },
     { collection: 'users', versionKey: false, strict: true }
@@ -103,6 +136,24 @@ async function getModels() {
   // (ISO strings compare lexicographically; $ne currentPackageId filtered).
   userSchema.index({ role: 1, packageExpireDate: 1 });
   userSchema.index({ deviceIdNorm: 1 }, { sparse: true });
+  userSchema.index({ referralCode: 1 }, { unique: true, partialFilterExpression: { referralCode: { $type: 'string' } } });
+
+  const referralSchema = new Schema(
+    {
+      referrerUserId: { type: Number, required: true },
+      referredUserId: { type: Number, required: true },
+      referralCode: { type: String, required: true, uppercase: true, trim: true },
+      status: { type: String, enum: ['pending', 'verified', 'rewarded', 'rejected'], default: 'pending' },
+      createdAt: { type: String, default: isoNow },
+      verifiedAt: { type: String, default: null },
+      rewardGranted: { type: Boolean, default: false },
+      rewardGrantedAt: { type: String, default: null },
+    },
+    { collection: 'referrals', versionKey: false, strict: true }
+  );
+  referralSchema.index({ referrerUserId: 1, createdAt: -1 });
+  referralSchema.index({ status: 1, createdAt: -1 });
+  referralSchema.index({ referrerUserId: 1, referredUserId: 1 }, { unique: true });
 
   const packageSchema = new Schema(
     {
@@ -330,6 +381,7 @@ async function getModels() {
    cached = {
      OtpCounter: mongoose.model('OtpCounter', counterSchema),
      OtpUser: mongoose.model('OtpUser', userSchema),
+    OtpReferral: mongoose.model('OtpReferral', referralSchema),
      OtpPackage: mongoose.model('OtpPackage', packageSchema),
      OtpMethod: mongoose.model('OtpMethod', methodSchema),
      OtpPayment: mongoose.model('OtpPayment', paymentSchema),
@@ -366,6 +418,7 @@ async function getModels() {
     backfilled = true;
     try {
       await backfillDeviceNorms(cached);
+      await backfillReferralCodes(cached);
     } catch (e) {
       console.warn('[mongo] backfill skipped:', e && e.message);
     }

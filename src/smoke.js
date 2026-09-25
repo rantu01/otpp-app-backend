@@ -83,6 +83,36 @@ async function main() {
   const prot = await call(port, 'GET', '/api/protected/demo', null, userTok);
   check('protected API allows active user', prot.status === 200, 'status=' + prot.status);
 
+  const referralCode = reg.json.user && reg.json.user.referralCode;
+  const referredEmail = 'referred' + Date.now() + '@t.com';
+  const referredReg = await call(port, 'POST', '/api/auth/register', {
+    name: 'Referred', email: referredEmail, password: 'pass1234', referralCode,
+  });
+  check('referral registration creates pending relationship', referredReg.status === 201 && referralCode, 'status=' + referredReg.status);
+  const referralCodeBad = await call(port, 'POST', '/api/auth/register', {
+    name: 'Bad Referral', email: 'badref' + Date.now() + '@t.com', password: 'pass1234', referralCode: 'OTPINVALID',
+  });
+  check('invalid referral rejected', referralCodeBad.status === 400, 'status=' + referralCodeBad.status);
+  const activateReferral = await call(port, 'PATCH', `/api/admin/users/${referredReg.json.user.id}/access`, { status: 'active' }, adminTok);
+  check('referral verifies on activation', activateReferral.status === 200, 'status=' + activateReferral.status);
+  const referredAccess = await call(port, 'GET', '/api/access/status', null, referredReg.json.token);
+  check('referred user receives backend free access', referredAccess.json.access && referredAccess.json.access.reason === 'REFERRAL_FREE', referredAccess.json.access && referredAccess.json.access.reason);
+  const mineReferral = await call(port, 'GET', '/api/referrals/me', null, userTok);
+  check('referrer progress is server backed', mineReferral.status === 200 && mineReferral.json.referral.successfulReferralCount >= 1, JSON.stringify(mineReferral.json.referral || {}).slice(0, 160));
+  const referralStats = await call(port, 'GET', '/api/admin/referrals/stats', null, adminTok);
+  check('admin referral stats are real', referralStats.status === 200 && referralStats.json.stats.joinedThroughReferrals >= 1, JSON.stringify(referralStats.json.stats || {}).slice(0, 160));
+  for (let i = 0; i < 3; i += 1) {
+    const extra = await call(port, 'POST', '/api/auth/register', {
+      name: 'Milestone ' + i, email: `milestone${Date.now()}${i}@t.com`, password: 'pass1234', referralCode,
+    });
+    await call(port, 'PATCH', `/api/admin/users/${extra.json.user.id}/access`, { status: 'active' }, adminTok);
+  }
+  const milestoneMine = await call(port, 'GET', '/api/referrals/me', null, userTok);
+  check('four verified referrals grant one milestone', milestoneMine.json.referral && milestoneMine.json.referral.totalRewards === 1, JSON.stringify(milestoneMine.json.referral || {}).slice(0, 160));
+  await call(port, 'PATCH', `/api/admin/users/${referredReg.json.user.id}/access`, { status: 'active' }, adminTok);
+  const repeatMine = await call(port, 'GET', '/api/referrals/me', null, userTok);
+  check('repeated activation does not duplicate reward', repeatMine.json.referral && repeatMine.json.referral.totalRewards === 1, JSON.stringify(repeatMine.json.referral || {}).slice(0, 160));
+
   const published = await call(port, 'PUT', '/api/admin/versions/android', {
     latestVersion: '2.0.0', latestVersionCode: 99,
     minimumSupportedVersion: '1.0.0', updateRequired: true,

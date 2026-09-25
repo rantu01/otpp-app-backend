@@ -15,6 +15,7 @@
  *  - Writes are single atomic ops (no read-before-write unless logic needs it).
  */
 const { getModels, deviceKey } = require('./models');
+const crypto = require('crypto');
 
 /* ---------- pure helpers (no I/O) ---------- */
 
@@ -29,6 +30,36 @@ function normalizeDeviceId(deviceId) {
 
 function nowIso() {
   return new Date().toISOString();
+}
+
+const REFERRAL_REQUIRED = Math.max(1, Number(process.env.REFERRAL_REQUIRED || 4));
+const REFERRER_REWARD_DAYS = Math.max(1, Number(process.env.REFERRER_REWARD_DAYS || 5));
+const REFERRED_REWARD_DAYS = Math.max(1, Number(process.env.REFERRED_REWARD_DAYS || 3));
+
+function referralConfig() {
+  return {
+    enabled: String(process.env.REFERRAL_ENABLED || 'true').toLowerCase() !== 'false',
+    requiredReferrals: REFERRAL_REQUIRED,
+    referrerRewardDays: REFERRER_REWARD_DAYS,
+    referredRewardDays: REFERRED_REWARD_DAYS,
+  };
+}
+
+function makeReferralCode() {
+  const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  const bytes = crypto.randomBytes(8);
+  let code = 'OTP';
+  for (const byte of bytes) code += alphabet[byte % alphabet.length];
+  return code;
+}
+
+async function uniqueReferralCode() {
+  const { OtpUser } = await getModels();
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    const code = makeReferralCode();
+    if (!(await OtpUser.exists({ referralCode: code }))) return code;
+  }
+  throw new Error('Could not generate a unique referral code.');
 }
 
 function cmpVersions(a, b) {
@@ -180,6 +211,13 @@ async function findUserByLogin(login) {
   return serialize(user);
 }
 
+async function findUserByReferralCode(code) {
+  const { OtpUser } = await getModels();
+  const value = String(code || '').trim().toUpperCase();
+  if (!value) return null;
+  return serialize(await OtpUser.findOne({ referralCode: value, role: { $ne: 'admin' } }).select(NO_HASH).lean());
+}
+
 /** Duplicate-account check without fetching the whole document. */
 async function loginExists(login) {
   const { OtpUser } = await getModels();
@@ -244,7 +282,7 @@ async function createUser(data) {
   const { OtpUser } = await getModels();
   const id = await nextId('user');
   try {
-    const doc = await OtpUser.create({ id, ...data });
+    const doc = await OtpUser.create({ id, ...data, referralCode: data.referralCode || await uniqueReferralCode() });
     return serialize(doc.toObject());
   } catch (e) {
     if (e && e.code === 11000) {
@@ -256,9 +294,188 @@ async function createUser(data) {
   }
 }
 
+async function createReferral(data) {
+  const { OtpReferral } = await getModels();
+  try {
+    const doc = await OtpReferral.create({ ...data, referralCode: String(data.referralCode || '').toUpperCase() });
+    return { ...serialize(doc.toObject()), created: true };
+  } catch (e) {
+    if (e && e.code === 11000) return { ...serialize(await OtpReferral.findOne({ referrerUserId: data.referrerUserId, referredUserId: data.referredUserId }).lean()), created: false };
+    throw e;
+  }
+}
+
+async function verifyReferralForUser(referredUserId) {
+  const config = referralConfig();
+  if (!config.enabled) return { verified: false, reason: 'DISABLED' };
+  const { OtpReferral, OtpUser } = await getModels();
+  const referral = await OtpReferral.findOneAndUpdate(
+    { referredUserId: Number(referredUserId), status: 'pending', rewardGranted: false },
+    { $set: { status: 'verified', verifiedAt: nowIso() } },
+    { returnDocument: 'after', updatePipeline: true }
+  ).lean();
+  if (!referral) return { verified: false, reason: 'ALREADY_VERIFIED' };
+
+  const referred = await OtpUser.findOneAndUpdate(
+    { id: Number(referredUserId), referredBy: Number(referral.referrerUserId) },
+    [
+      { $set: {
+        freeTrialDays: { $add: [{ $ifNull: ['$freeTrialDays', 0] }, config.referredRewardDays] },
+        freeTrialExpiresAt: {
+          $dateToString: {
+            date: { $add: [
+              { $cond: [
+                { $gt: [
+                  { $convert: { input: '$freeTrialExpiresAt', to: 'date', onError: new Date(0), onNull: new Date(0) } },
+                  '$$NOW',
+                ] },
+                { $convert: { input: '$freeTrialExpiresAt', to: 'date', onError: new Date(0), onNull: new Date(0) } },
+                '$$NOW',
+              ] },
+              config.referredRewardDays * 86400000,
+            ] },
+            format: '%Y-%m-%dT%H:%M:%S.%LZ',
+          },
+        },
+      } },
+    ],
+    { returnDocument: 'after', updatePipeline: true }
+  ).select(NO_HASH).lean();
+  if (!referred) return { verified: false, reason: 'REFERRED_USER_CHANGED' };
+
+  const referrer = await OtpUser.findOneAndUpdate(
+    { id: Number(referral.referrerUserId) },
+    { $inc: { successfulReferralCount: 1 } },
+    { returnDocument: 'after' }
+  ).select(NO_HASH).lean();
+  if (!referrer) return { verified: false, reason: 'REFERRER_NOT_FOUND' };
+
+  const milestone = Math.floor(Number(referrer.successfulReferralCount || 0) / config.requiredReferrals);
+  let reward = null;
+  if (milestone > Number(referrer.referralRewardCount || 0)) {
+    reward = await OtpUser.findOneAndUpdate(
+      { id: Number(referrer.id), referralRewardCount: { $lt: milestone } },
+      [
+        { $set: {
+          referralRewardCount: { $add: ['$referralRewardCount', 1] },
+          freeTrialDays: { $add: ['$freeTrialDays', config.referrerRewardDays] },
+          freeTrialExpiresAt: {
+            $dateToString: {
+              date: { $add: [
+                { $cond: [
+                  { $gt: [
+                    { $convert: { input: '$freeTrialExpiresAt', to: 'date', onError: new Date(0), onNull: new Date(0) } },
+                    '$$NOW',
+                  ] },
+                  { $convert: { input: '$freeTrialExpiresAt', to: 'date', onError: new Date(0), onNull: new Date(0) } },
+                  '$$NOW',
+                ] },
+                config.referrerRewardDays * 86400000,
+              ] },
+              format: '%Y-%m-%dT%H:%M:%S.%LZ',
+            },
+          },
+        } },
+      ],
+      { returnDocument: 'after', updatePipeline: true }
+    ).select(NO_HASH).lean();
+    if (reward) {
+      const milestoneRows = await OtpReferral.find({ referrerUserId: referrer.id, status: 'verified', rewardGranted: false })
+        .sort({ verifiedAt: 1 }).limit(config.requiredReferrals).select({ _id: 1 }).lean();
+      if (milestoneRows.length === config.requiredReferrals) {
+        await OtpReferral.updateMany(
+          { _id: { $in: milestoneRows.map((row) => row._id) } },
+          { $set: { status: 'rewarded', rewardGranted: true, rewardGrantedAt: nowIso() } }
+        ).catch(() => null);
+      }
+    }
+  }
+  return { verified: true, referral: serialize(referral), referred: serialize(referred), referrer: serialize(reward || referrer), rewardGranted: !!reward };
+}
+
+async function getMyReferral(userId) {
+  const { OtpUser, OtpReferral } = await getModels();
+  const [user, referrals] = await Promise.all([
+    OtpUser.findOne({ id: Number(userId) }).select(NO_HASH).lean(),
+    OtpReferral.find({ referrerUserId: Number(userId) }).sort({ createdAt: -1 }).lean(),
+  ]);
+  const config = referralConfig();
+  const count = Number(user && user.successfulReferralCount || 0);
+  const totalRewards = Number(user && user.referralRewardCount || 0);
+  const freeTrialDays = Number(user && user.freeTrialDays || 0);
+  const rewardMessage = user && user.referredBy && freeTrialDays > 0
+    ? `You joined through a referral and received ${REFERRED_REWARD_DAYS} free days.`
+    : totalRewards > 0
+      ? `Congratulations! You completed ${totalRewards * config.requiredReferrals} referrals and received ${totalRewards * config.referrerRewardDays} free days.`
+      : '';
+  return {
+    referralCode: user && user.referralCode || null,
+    referralCount: Number(user && user.referralCount || 0),
+    successfulReferralCount: count,
+    requiredReferrals: config.requiredReferrals,
+    remainingReferrals: Math.max(0, config.requiredReferrals - (count % config.requiredReferrals)),
+    rewardDays: config.referrerRewardDays,
+    totalRewards,
+    freeTrialDays,
+    freeTrialExpiresAt: user && user.freeTrialExpiresAt || null,
+    rewardMessage,
+    referrals: serialize(referrals),
+  };
+}
+
+async function listReferrals(opts = {}) {
+  const { OtpReferral, OtpUser } = await getModels();
+  const pg = pageParams(opts, 50, 100);
+  const filter = {};
+  if (opts.status && ['pending', 'verified', 'rewarded', 'rejected'].includes(String(opts.status))) filter.status = String(opts.status);
+  const search = String(opts.search || '').trim();
+  if (search) {
+    const userOr = [
+      { name: { $regex: escapeRegex(search), $options: 'i' } },
+      { email: { $regex: escapeRegex(search), $options: 'i' } },
+      { phone: { $regex: escapeRegex(search), $options: 'i' } },
+    ];
+    if (/^\d+$/.test(search)) userOr.push({ id: Number(search) });
+    const matchingUsers = await OtpUser.find({ $or: userOr }).select({ id: 1 }).lean();
+    const ids = matchingUsers.map((user) => user.id);
+    filter.$or = [{ referralCode: { $regex: escapeRegex(search), $options: 'i' } }, { referrerUserId: { $in: ids } }, { referredUserId: { $in: ids } }];
+  }
+  const [rows, total] = await Promise.all([
+    OtpReferral.find(filter).sort({ createdAt: -1 }).skip(pg.skip).limit(pg.limit).lean(),
+    fastCount(OtpReferral, filter),
+  ]);
+  const ids = [...new Set(rows.flatMap((r) => [r.referrerUserId, r.referredUserId]))];
+  const users = await OtpUser.find({ id: { $in: ids } }).select({ passwordHash: 0 }).lean();
+  const byId = new Map(users.map((u) => [u.id, u]));
+  return { referrals: rows.map((r) => ({ ...serialize(r), referrer: publicUser(byId.get(r.referrerUserId)), referred: publicUser(byId.get(r.referredUserId)) })), total, page: pg.page, limit: pg.limit, hasMore: pg.skip + rows.length < total };
+}
+
+async function referralStats() {
+  const { OtpReferral, OtpUser } = await getModels();
+  const [totalUsers, joined, successful, rewards, days] = await Promise.all([
+    OtpUser.countDocuments({ role: { $in: ['user', 'free'] } }),
+    OtpReferral.countDocuments({}),
+    OtpReferral.countDocuments({ status: { $in: ['verified', 'rewarded'] } }),
+    OtpUser.aggregate([{ $group: { _id: null, count: { $sum: '$referralRewardCount' }, days: { $sum: '$freeTrialDays' } } }]),
+    OtpUser.find({ role: { $in: ['user', 'free'] }, successfulReferralCount: { $gt: 0 } }).select({ id: 1, name: 1, referralCode: 1, successfulReferralCount: 1, referralRewardCount: 1 }).sort({ successfulReferralCount: -1 }).limit(10).lean(),
+  ]);
+  const totals = rewards[0] || { count: 0, days: 0 };
+  return { totalUsers, joinedThroughReferrals: joined, successfulReferrals: successful, totalReferralRewards: totals.count || 0, totalFreeDaysDistributed: totals.days || 0, topReferrers: serialize(days), config: referralConfig() };
+}
+
 async function updateUserById(id, patch) {
   const { OtpUser } = await getModels();
   const doc = await OtpUser.findOneAndUpdate({ id: Number(id) }, { $set: patch }, { returnDocument: 'after' }).select(NO_HASH).lean();
+  return serialize(doc);
+}
+
+async function incrementUserCounters(id, increments) {
+  const { OtpUser } = await getModels();
+  const doc = await OtpUser.findOneAndUpdate(
+    { id: Number(id) },
+    { $inc: increments },
+    { returnDocument: 'after' }
+  ).select(NO_HASH).lean();
   return serialize(doc);
 }
 
@@ -542,6 +759,7 @@ async function approvePaymentAtomic(paymentId, reviewerId, opts) {
     createdBy: typeof reviewerId === 'number' ? reviewerId : null,
     deviceId: userDoc.deviceIdNorm || userDoc.deviceId || null,
   });
+  await verifyReferralForUser(userDoc.id);
   // Auto-approvals stamp a positive note (manual approvals cleared any
   // stale auto-verify note in the $set above, so they stay null).
   let outPayment = serialize(payment);
@@ -1270,9 +1488,9 @@ module.exports = {
   // counters
   nextId,
   // users
-  findUserById, findUserRawById, findUserByLogin, userLoginExists, loginExists,
+  findUserById, findUserRawById, findUserByLogin, findUserByReferralCode, userLoginExists, loginExists,
   findUserByDeviceNorm, findUserByDevice, listUsers, createUser,
-  updateUserById, updateUserPassword, deleteUserById, countUsers,
+  updateUserById, incrementUserCounters, updateUserPassword, deleteUserById, countUsers,
   // packages / methods
   listPackages, findPackageById, createPackage, updatePackageById, deletePackageById,
   listMethods, findMethodById, createMethod, updateMethodById, deleteMethodById,
@@ -1299,4 +1517,6 @@ module.exports = {
   findPendingPaymentsByTxNorm, claimReceivedForPayment, tryAutoApprove,
   // misc
   activationWindow,
+  referralConfig, uniqueReferralCode, createReferral, verifyReferralForUser,
+  getMyReferral, listReferrals, referralStats,
 };
